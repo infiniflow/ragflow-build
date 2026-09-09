@@ -117,6 +117,16 @@ jobs:
         with:
           python-version: '3.12'
 
+      # ORT's --include_ops_by_config path (reduce_op_kernels.py) imports
+      # parse_config from the `util` package, which is only re-exported when
+      # flatbuffers is importable (see onnxruntime/tools/python/util/__init__.py).
+      # Without it the build dies at import time with
+      #   ImportError: cannot import name 'parse_config' from 'util'
+      # The local dev venv pulls flatbuffers in transitively; CI's bare
+      # setup-python image does not, so install it explicitly.
+      - name: Install build deps
+        run: python -m pip install --upgrade pip flatbuffers
+
       - name: Setup Ninja (unix)
         if: runner.os != 'Windows'
         uses: seanmiddleditch/gha-setup-ninja@master
