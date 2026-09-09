@@ -103,8 +103,12 @@ echo "==> copied $copied_headers headers"
 # headers are portable across every platform we ship.
 found_noexc=0
 while IFS= read -r header; do
-    # `-i ''` is the portable in-place form for both BSD (macOS) and GNU sed.
-    sed -i '' -e 's/#define NO_EXCEPTION noexcept$/#define NO_EXCEPTION/' "$header"
+    # Use a non-empty backup suffix `-i.bak` (removed right after): the
+    # space-separated empty form `sed -i ''` is ambiguous on GNU sed, which
+    # treats the empty string as a filename to read and fails. The attached
+    # `.bak` form is parsed identically by both BSD (macOS) and GNU sed.
+    sed -i.bak -e 's/#define NO_EXCEPTION noexcept$/#define NO_EXCEPTION/' "$header"
+    rm -f "$header.bak"
     found_noexc=$((found_noexc + 1))
 done < <(find "$STAGE_DIR/include" -type f \( -name '*.h' -o -name '*.inc' \) | sort)
 echo "==> neutralized NO_EXCEPTION in $found_noexc header files"
