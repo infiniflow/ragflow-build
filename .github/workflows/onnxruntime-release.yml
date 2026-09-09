@@ -209,7 +209,11 @@ jobs:
 
           cxx="${CXX:-c++}"
           if [ "$(uname -s)" = "Darwin" ]; then
-            libs="-lc++ -lpthread -lm"
+            # ORT's static lib references macOS system frameworks (absl/cctz pulls
+            # CoreFoundation for local_time_zone(); apple_log_sink.mm pulls
+            # Foundation for NSLog). They are left unresolved in the .a and must
+            # be supplied by the final linker.
+            libs="-lc++ -lpthread -lm -framework CoreFoundation -framework Foundation -framework Security"
           else
             libs="-lpthread -ldl -lm"
           fi
