@@ -304,10 +304,12 @@ source commit : $(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknow
 configuration :
   Release / static library (onnxruntime_BUILD_SHARED_LIB=OFF)
   --minimal_build
-  --disable_contrib_ops
   --disable_ml_ops
   --disable_rtti
   --disable_exceptions
+  --include_ops_by_config required_operators.config
+  (contrib ops stay enabled: the DeepDoc weights need the com.microsoft
+   fused kernels - FusedConv, FusedMatMul, QuickGelu)
 
 contents      :
   include/  public C/C++ headers (flattened, same layout as upstream packages)

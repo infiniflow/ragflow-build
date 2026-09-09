@@ -50,16 +50,16 @@ cd onnxruntime
     --config Release \
     --cmake_extra_defines onnxruntime_BUILD_SHARED_LIB=OFF \
     --minimal_build \
-    --disable_contrib_ops \
     --disable_ml_ops \
     --disable_rtti \
     --disable_exceptions \
+    --include_ops_by_config onnxruntime/required_operators.config \
     --parallel
 ```
 
 All of the flags above are already the defaults, so a plain `./build.sh` is
-identical. Anything you pass is forwarded to upstream
-`tools/ci_build/build.py`; project managed options take precedence:
+identical. Note that `--disable_contrib_ops` is **not** one of them, see
+[Operator allow list](#operator-allow-list).
 
 | Option | Description |
 | --- | --- |
@@ -132,9 +132,9 @@ uncompressed — versus ~200 MB for a default full build.
 
 #### What goes into the fat archive
 
-`--minimal_build` drops CUDA, contrib ops and ML ops, but **not** the ONNX
-protobuf layer, which ORT still needs to read model metadata and opsets. These
-are genuine dependencies, verified with `nm --undefined-only` on the component
+`--minimal_build` drops CUDA and (with `--disable_ml_ops`) the ML ops, but
+**not** the ONNX protobuf layer, which ORT still needs to read model metadata
+and opsets. These are genuine dependencies, verified with `nm --undefined-only` on the component
 libs (`onnxruntime_framework` alone references ~251 abseil, 94 onnx and 45
 protobuf symbols):
 
@@ -158,6 +158,39 @@ every object to resolve) and diffing the undefined symbols before and after:
 are three `OrtInteropAPI::ReleaseExternal*` entry points belonging to the plugin
 EP interop layer, which are absent upstream as well and never referenced by a
 normal link.
+
+#### Operator allow list
+
+The build is reduced to the operators RAGFlow actually needs via
+`--include_ops_by_config onnxruntime/required_operators.config`. Without it,
+`--minimal_build` still compiles the whole kernel registry, which is most of
+what a "minimal" build otherwise saves.
+
+The list is generated from the DeepDoc weights (`det`, `rec`, `tsr`, `layout`
+and the layout domain variants) and is checked in. Regenerate it whenever the
+models change:
+
+```bash
+pip install onnxruntime onnx
+onnxruntime/scripts/gen_required_ops.sh            # pulls the models from the Hub
+onnxruntime/scripts/gen_required_ops.sh --models /path/to/onnx
+```
+
+A model needing an operator that is not in the list fails at runtime with
+`Could not find an implementation for <Op>(<opset>)`, so a stale list ships a
+build that cannot serve. The release workflow guards against that by loading
+all four DeepDoc models with the packaged archive before uploading it.
+
+Two things that are easy to get wrong:
+
+- **Do not add `--disable_contrib_ops`.** The DeepDoc weights come from
+  PaddlePaddle and use the `com.microsoft` fused kernels (`FusedConv`,
+  `FusedMatMul`, `QuickGelu`) — they are in the allow list precisely because
+  they are required. Disabling contrib ops makes every model fail to load even
+  though the build succeeds.
+- **Keep type reduction off.** `--enable_type_reduction` would emit
+  `required_operators_and_types.config` and narrow each kernel to the observed
+  types, which is a further size win but a much tighter contract to maintain.
 
 ---
 
@@ -280,12 +313,13 @@ onnxruntime/scripts/bump.sh v1.30.0
 ```
 
 That verifies the tag exists upstream, writes it to `onnxruntime/ORT_VERSION`,
-checks the submodule out at it (`--depth 1`) and refreshes the recursive deps.
+checks the submodule out at it (`--depth 1`), refreshes the recursive deps and
+regenerates the operator allow list (`--skip-ops-config` to skip that step).
 Then verify and commit:
 
 ```bash
 cd onnxruntime && ./build.sh --jobs 4
-git add onnxruntime/ORT_VERSION onnxruntime/onnxruntime
+git add onnxruntime/ORT_VERSION onnxruntime/onnxruntime onnxruntime/required_operators.config
 git commit -m "onnxruntime: bump to v1.30.0"
 ```
 

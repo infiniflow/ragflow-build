@@ -140,9 +140,81 @@ jobs:
           # Equivalent to:
           #   --config Release
           #   --cmake_extra_defines onnxruntime_BUILD_SHARED_LIB=OFF
-          #   --minimal_build --disable_contrib_ops --disable_ml_ops
-          #   --disable_rtti --disable_exceptions --parallel
+          #   --minimal_build --disable_ml_ops --disable_rtti --disable_exceptions
+          #   --parallel --include_ops_by_config onnxruntime/required_operators.config
+          #
+          # --disable_contrib_ops is intentionally NOT used: the DeepDoc weights
+          # need the com.microsoft fused kernels listed in that config.
           bash "${{ env.ORT_PKG }}/build.sh" --target "${{ matrix.target }}"
+
+      - name: Smoke test (load the DeepDoc models)
+        # A build that compiles fine can still be unable to load the models it
+        # was reduced for, so link the packaged archive and create a session for
+        # every weight before the artifact is uploaded or released.
+        shell: bash
+        env:
+          HF_ENDPOINT: https://huggingface.co
+          DEEPDOC_MODELS: det layout rec tsr
+        run: |
+          set -euo pipefail
+          pkg="${{ env.ORT_PKG }}"
+          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
+
+          work="$(mktemp -d)"
+          unzip -q "$zip_path" -d "$work"
+          lib_dir="$(find "$work" -type d -name lib -print -quit)"
+          [ -n "$lib_dir" ] || { echo "::error::no lib/ directory in $zip_path"; exit 1; }
+          root="$(dirname "$lib_dir")"
+          [ -f "$root/lib/libonnxruntime.a" ] || { echo "::error::libonnxruntime.a missing"; exit 1; }
+
+          models="$work/models"
+          mkdir -p "$models"
+          for m in $DEEPDOC_MODELS; do
+            # --retry alone does not cover transport errors such as
+            # "SSL_ERROR_SYSCALL", and a flaky download must not fail a release.
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
+              -o "$models/$m.ort" \
+              "$HF_ENDPOINT/InfiniFlow/deepdoc/resolve/main/$m.ort" \
+              || { echo "::error::failed to download $m.ort"; exit 1; }
+          done
+
+          cat > "$work/probe.c" <<'EOF'
+          #include <stdio.h>
+          #include "onnxruntime_c_api.h"
+          int main(int argc, char **argv) {
+              const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+              OrtEnv *env = NULL; OrtSessionOptions *so = NULL; OrtSession *s = NULL;
+              if (api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "smoke", &env) != NULL) return 2;
+              if (api->CreateSessionOptions(&so) != NULL) return 2;
+              OrtStatus *st = api->CreateSession(env, argv[1], so, &s);
+              if (st != NULL) {
+                  fprintf(stderr, "FAIL %s: %s\n", argv[1], api->GetErrorMessage(st));
+                  return 1;
+              }
+              printf("ok   %s\n", argv[1]);
+              return 0;
+          }
+          EOF
+
+          cxx="${CXX:-c++}"
+          if [ "$(uname -s)" = "Darwin" ]; then
+            libs="-lc++ -lpthread -lm"
+          else
+            libs="-lpthread -ldl -lm"
+          fi
+          "$cxx" -O0 -o "$work/probe" "$work/probe.c" -I"$root/include" \
+              "$root/lib/libonnxruntime.a" $libs
+
+          fail=0
+          for m in $DEEPDOC_MODELS; do
+            "$work/probe" "$models/$m.ort" || fail=1
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the build cannot load every DeepDoc model"
+            exit 1
+          fi
+          echo "all DeepDoc models loaded"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -195,7 +267,10 @@ jobs:
             echo "Customized **static** onnxruntime ${version} build."
             echo
             echo "Configuration: \`Release\`, static library (\`onnxruntime_BUILD_SHARED_LIB=OFF\`),"
-            echo "\`--minimal_build --disable_contrib_ops --disable_ml_ops --disable_rtti --disable_exceptions\`."
+            echo "\`--minimal_build --disable_ml_ops --disable_rtti --disable_exceptions\`,"
+            echo "reduced to the operators in \`required_operators.config\`"
+            echo "(\`--include_ops_by_config\`). Contrib ops stay enabled: the DeepDoc weights"
+            echo "need the \`com.microsoft\` fused kernels."
             echo "Upstream ships shared libraries only, hence this repo."
             echo
             echo "## Downloads"

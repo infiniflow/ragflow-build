@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# Build a customized onnxruntime (minimal, static, no contrib/ml ops, no RTTI,
-# no exceptions) for the current host or for an explicit target platform.
+# Build a customized onnxruntime (minimal, static, reduced operator set, no
+# ml ops, no RTTI, no exceptions) for the current host or for an explicit
+# target platform.
 #
 # The upstream onnxruntime sources live in the git submodule
 # `onnxruntime/onnxruntime` (pinned to the version in `onnxruntime/ORT_VERSION`).
@@ -10,7 +11,7 @@
 #   ./build.sh
 #   ./build.sh --config Release \
 #              --cmake_extra_defines onnxruntime_BUILD_SHARED_LIB=OFF \
-#              --minimal_build --disable_contrib_ops --disable_ml_ops \
+#              --minimal_build --disable_ml_ops \
 #              --disable_rtti --disable_exceptions --parallel
 #   ./build.sh --target osx-universal
 #   ./build.sh --target windows-arm64 --build-dir /tmp/ort-build
@@ -37,6 +38,9 @@ SCRIPT_DIR="$PKG_DIR/scripts"
 ORT_SRC="$PKG_DIR/onnxruntime"
 ORT_VERSION_FILE="$PKG_DIR/ORT_VERSION"
 ORT_VERSION="$(tr -d '[:space:]' < "$ORT_VERSION_FILE")"
+# Operator allow list this build is reduced to. Regenerate it whenever the
+# models change: scripts/gen_required_ops.sh
+REQUIRED_OPS_CONFIG="$PKG_DIR/required_operators.config"
 ORT_BUILD_PY="$ORT_SRC/tools/ci_build/build.py"
 
 SUPPORTED_TARGETS="linux-x86_64 linux-aarch64 osx-arm64 osx-x86_64 osx-universal windows-x64 windows-arm64"
@@ -54,10 +58,18 @@ JOBS=""
 # --- defaults requested by this project ------------------------------------
 # store_true style flags that are ON unless the user passes them explicitly
 # (--parallel is handled separately so it can take a job count)
-DEFAULT_FLAGS=(--minimal_build --disable_contrib_ops --disable_ml_ops \
+#
+# NOTE: --disable_contrib_ops is deliberately NOT in this list. RAGFlow's
+# DeepDoc weights are converted from PaddlePaddle models and depend on the
+# com.microsoft fused kernels (FusedConv, FusedMatMul, QuickGelu); dropping
+# contrib ops makes every DeepDoc model fail with
+# "Could not find an implementation for FusedConv(1)". Operator coverage is
+# narrowed by the allow list in required_operators.config instead, which keeps
+# those kernels while still excluding everything the models do not use.
+DEFAULT_FLAGS=(--minimal_build --disable_ml_ops \
                --disable_rtti --disable_exceptions)
 # --key value style defaults
-DEFAULT_KV=(--config Release)
+DEFAULT_KV=(--config Release --include_ops_by_config "$REQUIRED_OPS_CONFIG")
 # -D style defaults (user values are appended, so they win)
 DEFAULT_CMAKE_DEFINES=(
     onnxruntime_BUILD_SHARED_LIB=OFF
@@ -200,6 +212,13 @@ while [ $# -gt 0 ]; do
             USER_CMAKE_DEFINES+=("$2")
             mark_seen "--cmake_extra_defines"
             shift 2 ;;
+        --include_ops_by_config)
+            # Key/value pair: forward both tokens and remember it so the
+            # default allow list below is not applied as well.
+            [ $# -ge 2 ] || die "--include_ops_by_config requires a value"
+            USER_ARGS+=("$1" "$2")
+            mark_seen "--include_ops_by_config"
+            shift 2 ;;
         --config|--build_dir|--cmake_generator|--osx_arch|--path_to_protoc_exe|--target|-t)
             # handled or rejected below; stay out of the default merging
             die "'$1' is managed by this script, use the documented project options instead" ;;
@@ -225,6 +244,12 @@ esac
 # sanity checks
 # ---------------------------------------------------------------------------
 [ -f "$ORT_BUILD_PY" ] || die "onnxruntime submodule missing at $ORT_SRC, run 'git submodule update --init --recursive'"
+
+# The shipped allow list is only applied when the caller did not pass one, so
+# only require the file in that case.
+if ! has_seen "--include_ops_by_config" && [ ! -f "$REQUIRED_OPS_CONFIG" ]; then
+    die "missing operator allow list $REQUIRED_OPS_CONFIG; regenerate it with scripts/gen_required_ops.sh"
+fi
 
 PYTHON="$(command -v python3 || command -v python || true)"
 [ -n "$PYTHON" ] || die "python3 is required to drive onnxruntime's build"
