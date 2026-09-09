@@ -92,6 +92,23 @@ if [ "$copied_headers" -eq 0 ]; then
 fi
 echo "==> copied $copied_headers headers"
 
+# --- neutralize NO_EXCEPTION for C++17+ consumers -----------------------------
+# ORT v1.29.0's onnxruntime_c_api.h defines `NO_EXCEPTION noexcept` and places
+# it inside function-pointer typedefs (e.g. OrtApiBase / OrtApi / logging
+# callbacks). Exception specifications in typedefs are invalid in C++17+ and a
+# hard error under Apple clang ("exception specifications are not allowed in
+# typedefs"), so the official release headers fail to compile on macOS and
+# under any -std=c++17+ binding (our cgo binding links with -std=c++20). g++
+# only tolerates it as a warning. Neutralize the macro so the distributed
+# headers are portable across every platform we ship.
+found_noexc=0
+while IFS= read -r header; do
+    # `-i ''` is the portable in-place form for both BSD (macOS) and GNU sed.
+    sed -i '' -e 's/#define NO_EXCEPTION noexcept$/#define NO_EXCEPTION/' "$header"
+    found_noexc=$((found_noexc + 1))
+done < <(find "$STAGE_DIR/include" -type f \( -name '*.h' -o -name '*.inc' \) | sort)
+echo "==> neutralized NO_EXCEPTION in $found_noexc header files"
+
 # --- collect every static library --------------------------------------------
 # Includes the third party deps CMake builds under _deps/; only object dirs are
 # skipped.
