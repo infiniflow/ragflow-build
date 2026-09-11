@@ -84,7 +84,11 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
-            os: ubuntu-latest
+            # ubuntu-22.04 pins glibc 2.35 / GCC 11.4: the oldest toolchain that
+            # still satisfies ORT's GCC>=11.1 floor while NOT emitting the
+            # non-portable __isoc23_* (glibc>=2.38) or _M_replace_cold (GCC>=12)
+            # symbols. The published .a must link on the consumer's Ubuntu 22.04.
+            os: ubuntu-22.04
           # Native arm64 runner. If your repo has no access to arm runners,
           # change os to ubuntu-latest: onnxruntime/build.sh then falls back to
           # aarch64 cross compilation (see scripts/cross-linux-aarch64.sh).
@@ -112,10 +116,13 @@ jobs:
         with:
           submodules: false
 
+      # Python 3.10 mirrors the portable build recipe (ubuntu-22.04's system
+      # interpreter). ORT's build.py uses PEP 585 generics, so the runtime must
+      # be >= 3.9; 3.10 satisfies that and needs no extra venv toolchain.
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
 
       # ORT's --include_ops_by_config path (reduce_op_kernels.py) imports
       # parse_config from the `util` package, which is only re-exported when
@@ -124,8 +131,11 @@ jobs:
       #   ImportError: cannot import name 'parse_config' from 'util'
       # The local dev venv pulls flatbuffers in transitively; CI's bare
       # setup-python image does not, so install it explicitly.
+      #
+      # ubuntu-22.04 ships CMake 3.22, but ORT 1.29.0 requires >= 3.28. Pull a
+      # current CMake from PyPI (same mechanism already used for flatbuffers).
       - name: Install build deps
-        run: python -m pip install --upgrade pip flatbuffers
+        run: python -m pip install --upgrade pip "cmake>=3.28" flatbuffers
 
       - name: Setup Ninja (unix)
         if: runner.os != 'Windows'
@@ -229,6 +239,34 @@ jobs:
             exit 1
           fi
           echo "all DeepDoc models loaded"
+
+      # Portability gate: the Linux x86_64 archive must NOT contain symbols that
+      # only exist on toolchains newer than ubuntu-22.04 (glibc 2.35 / GCC 11.4).
+      #   - __isoc23_*       : ISO C23 stdio, present only in glibc >= 2.38
+      #   - _M_replace_cold  : emitted by libstdc++ from GCC >= 12
+      # Either makes the published .a unlinkable on the consumer's Ubuntu 22.04.
+      # The Linux job runs on ubuntu-22.04 precisely to avoid them; this fails
+      # the release loudly if a future runner image silently bumps the toolchain.
+      - name: Portability gate (nm) — linux-x86_64
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="${{ env.ORT_PKG }}"
+          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
+          work="$(mktemp -d)"
+          unzip -q "$zip_path" -d "$work"
+          a_path="$(find "$work" -type f -name libonnxruntime.a -print -quit)"
+          [ -n "$a_path" ] || { echo "::error::libonnxruntime.a missing in $zip_path"; exit 1; }
+          echo "Scanning $a_path for non-portable symbols..."
+          if nm "$a_path" 2>/dev/null | grep -E '__isoc23_|_M_replace_cold'; then
+            echo "::error::non-portable symbols in $a_path"
+            echo "::error::  __isoc23_* needs glibc>=2.38; _M_replace_cold needs libstdc++ from GCC>=12"
+            echo "::error::  the Linux job must build on ubuntu-22.04 (glibc 2.35 / GCC 11.4)"
+            exit 1
+          fi
+          echo "OK: no __isoc23_* / _M_replace_cold (glibc 2.35 / GCC 11.4 portable)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
