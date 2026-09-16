@@ -40,6 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
+      base_version: ${{ steps.version.outputs.base_version }}
     steps:
       - uses: actions/checkout@v4
       - id: version
@@ -71,7 +72,16 @@ jobs:
             *) echo "::error::version '$version' must start with 'v' (e.g. v1.29.0)"; exit 1 ;;
           esac
 
+          # The upstream onnxruntime is fetched from microsoft/onnxruntime, where
+          # only real releases exist (e.g. v1.29.0). A release tag may carry a
+          # vendor suffix like -patch1; strip it to get the tag we actually fetch
+          # and build (the patch is applied on top by init-submodules.sh).
+          base_version="${version%-*}"
+          [ "$base_version" != "$version" ] && \
+            echo "::notice::release tag '$version' -> fetching upstream '$base_version' + vendored patches"
+
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
           echo "onnxruntime version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME)"
 
   build:
@@ -147,11 +157,11 @@ jobs:
         with:
           arch: ${{ matrix.target == 'windows-arm64' && 'amd64_arm64' || 'x64' }}
 
-      - name: Fetch onnxruntime ${{ needs.prepare.outputs.version }}
+      - name: Fetch onnxruntime ${{ needs.prepare.outputs.base_version }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "${{ needs.prepare.outputs.version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"
+          echo "${{ needs.prepare.outputs.base_version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"
           bash "${{ env.ORT_PKG }}/scripts/init-submodules.sh"
 
       - name: Build ${{ matrix.target }}
@@ -239,6 +249,39 @@ jobs:
             exit 1
           fi
           echo "all DeepDoc models loaded"
+
+      - name: Verify shared-initializer APIs (linux-x86_64)
+        # The shipped static lib must expose the custom shared-initializer APIs
+        # (SessionGetInitializer*) and shared-weight inference must work end to
+        # end. Build tools/verify_shared_weights/verify.cpp against the packaged
+        # archive and run it on a DeepDoc weight. Fails the release if the
+        # vendored patch did not make it into the built library.
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        env:
+          HF_ENDPOINT: https://huggingface.co
+        run: |
+          set -euo pipefail
+          pkg="${{ env.ORT_PKG }}"
+          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
+          work="$(mktemp -d)"
+          unzip -q "$zip_path" -d "$work"
+          root="$(find "$work" -maxdepth 1 -type d -name 'onnxruntime-*' | head -1)"
+          [ -f "$root/lib/libonnxruntime.a" ] || { echo "::error::libonnxruntime.a missing"; exit 1; }
+
+          mkdir -p "$work/models"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
+            -o "$work/models/rec.ort" \
+            "$HF_ENDPOINT/InfiniFlow/deepdoc/resolve/main/rec.ort" \
+            || { echo "::error::failed to download rec.ort"; exit 1; }
+
+          cxx="${CXX:-c++}"
+          "$cxx" -O0 -std=c++17 -o "$work/verify" \
+            "${{ github.workspace }}/tools/verify_shared_weights/verify.cpp" \
+            -I"$root/include" "$root/lib/libonnxruntime.a" -lpthread -ldl -lm
+
+          "$work/verify" "$work/models/rec.ort" 4
 
       # Portability gate: the Linux x86_64 archive must NOT contain symbols that
       # only exist on toolchains newer than ubuntu-22.04 (glibc 2.35 / GCC 11.4).

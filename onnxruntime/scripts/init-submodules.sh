@@ -42,6 +42,23 @@ git fetch --depth 1 origin "refs/tags/${ORT_VERSION}:refs/tags/${ORT_VERSION}" \
     || git fetch origin --tags --force
 git checkout --detach "$ORT_VERSION"
 
+# Apply vendored patches on top of the pinned tag. The upstream onnxruntime is
+# pristine microsoft/onnxruntime; custom changes (e.g. the shared-initializer
+# APIs) live as patches under onnxruntime/patches so they survive a clean
+# checkout and the CI rebuild (which re-fetches the upstream tag from scratch).
+PATCH_DIR="$PKG_DIR/patches"
+if [ -d "$PATCH_DIR" ]; then
+    shopt -s nullglob
+    for p in "$PATCH_DIR"/*.patch; do
+        echo "==> applying vendor patch $(basename "$p")"
+        git apply --whitespace=nowarn "$p" || {
+            echo "::error::failed to apply vendored patch $p"
+            exit 1
+        }
+    done
+    shopt -u nullglob
+fi
+
 echo "==> fetching recursive dependencies"
 if [ "$FULL" -eq 1 ]; then
     git submodule update --init --recursive

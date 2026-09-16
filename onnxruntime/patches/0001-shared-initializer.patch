@@ -1,0 +1,192 @@
+diff --git a/include/onnxruntime/core/session/onnxruntime_c_api.h b/include/onnxruntime/core/session/onnxruntime_c_api.h
+index 311f3cd..c0a4136 100644
+--- a/include/onnxruntime/core/session/onnxruntime_c_api.h
++++ b/include/onnxruntime/core/session/onnxruntime_c_api.h
+@@ -7547,6 +7547,17 @@ struct OrtApi {
+    */
+   ORT_API2_STATUS(SessionOptionsSetWeightlessSourceModelBuffer, _Inout_ OrtSessionOptions* options,
+                   _In_ const void* source_model_data, _In_ size_t source_model_data_length);
++
++  // --- Shared-initializer support (custom): extract already-loaded constant
++  //     initializers from a session so they can be re-injected via AddInitializer
++  //     into other sessions, sharing one copy of the weights in memory. ---
++  ORT_API2_STATUS(SessionGetInitializerCount, _In_ const OrtSession* session, _Out_ size_t* out);
++
++  ORT_API2_STATUS(SessionGetInitializerName, _In_ const OrtSession* session, size_t index,
++                  _Inout_ OrtAllocator* allocator, _Outptr_ char** output);
++
++  ORT_API2_STATUS(SessionGetInitializer, _In_ const OrtSession* session, _In_z_ const char* name,
++                  _Outptr_ OrtValue** out);
+ };
+ 
+ /*
+diff --git a/onnxruntime/core/session/onnxruntime_c_api.cc b/onnxruntime/core/session/onnxruntime_c_api.cc
+index 4a1d2ca..ca8b73e 100644
+--- a/onnxruntime/core/session/onnxruntime_c_api.cc
++++ b/onnxruntime/core/session/onnxruntime_c_api.cc
+@@ -1915,6 +1915,133 @@ ORT_API_STATUS_IMPL(OrtApis::SessionGetOverridableInitializerName, _In_ const Or
+   API_IMPL_END
+ }
+ 
++// --- Shared-initializer support (custom): extract already-loaded constant
++//     initializers from a session so they can be re-injected via AddInitializer
++//     into other sessions, sharing one copy of the weights in memory. ---
++
++ORT_API_STATUS_IMPL(OrtApis::SessionGetInitializerCount, _In_ const OrtSession* sess, _Out_ size_t* out) {
++  API_IMPL_BEGIN
++  auto session = reinterpret_cast<const ::onnxruntime::InferenceSession*>(sess);
++  const auto& state = session->GetSessionState();
++  *out = state.GetInitializedTensors().size();
++  return nullptr;
++  API_IMPL_END
++}
++
++ORT_API_STATUS_IMPL(OrtApis::SessionGetInitializerName, _In_ const OrtSession* sess, size_t index,
++                    _Inout_ OrtAllocator* allocator, _Outptr_ char** output) {
++  API_IMPL_BEGIN
++  auto session = reinterpret_cast<const ::onnxruntime::InferenceSession*>(sess);
++  const auto& state = session->GetSessionState();
++  const auto& tensors = state.GetInitializedTensors();
++  if (index >= tensors.size())
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer index out of range");
++  size_t i = 0;
++  std::string name;
++  for (const auto& kv : tensors) {
++    if (i++ == index) {
++      if (!state.GetOrtValueNameIdxMap().GetName(kv.first, name).IsOK())
++        return OrtApis::CreateStatus(ORT_FAIL, "failed to resolve initializer name");
++      break;
++    }
++  }
++  *output = onnxruntime::StrDup(name, allocator);
++  return nullptr;
++  API_IMPL_END
++}
++
++ORT_API_STATUS_IMPL(OrtApis::SessionGetInitializer, _In_ const OrtSession* sess, _In_z_ const char* name,
++                    _Outptr_ OrtValue** out) {
++  API_IMPL_BEGIN
++  auto session = reinterpret_cast<const ::onnxruntime::InferenceSession*>(sess);
++  const auto& state = session->GetSessionState();
++  int idx = 0;
++  if (!state.GetOrtValueNameIdxMap().GetIdx(name, idx).IsOK())
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer not found");
++  const auto& tensors = state.GetInitializedTensors();
++  auto it = tensors.find(idx);
++  if (it == tensors.end())
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer not found");
++  const OrtValue* src = &it->second;
++
++  OrtTensorTypeAndShapeInfo* info = nullptr;
++  if (OrtStatus* s = OrtApis::GetTensorTypeAndShape(src, &info)) return s;
++  ONNXTensorElementDataType elem_type;
++  if (OrtStatus* s = OrtApis::GetTensorElementType(info, &elem_type)) {
++    OrtApis::ReleaseTensorTypeAndShapeInfo(info);
++    return s;
++  }
++  size_t elem_count = 0;
++  if (OrtStatus* s = OrtApis::GetTensorShapeElementCount(info, &elem_count)) {
++    OrtApis::ReleaseTensorTypeAndShapeInfo(info);
++    return s;
++  }
++  size_t dims_count = 0;
++  if (OrtStatus* s = OrtApis::GetDimensionsCount(info, &dims_count)) {
++    OrtApis::ReleaseTensorTypeAndShapeInfo(info);
++    return s;
++  }
++  std::vector<int64_t> dims(dims_count);
++  if (OrtStatus* s = OrtApis::GetDimensions(info, dims.data(), dims_count)) {
++    OrtApis::ReleaseTensorTypeAndShapeInfo(info);
++    return s;
++  }
++  OrtApis::ReleaseTensorTypeAndShapeInfo(info);
++
++  size_t elem_size = 0;
++  switch (elem_type) {
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64: elem_size = 4; break;
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128: elem_size = 8; break;
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16: elem_size = 2; break;
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: elem_size = 1; break;
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32: elem_size = 4; break;
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
++    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64: elem_size = 8; break;
++    default: return OrtApis::CreateStatus(ORT_FAIL, "unsupported element type for initializer copy");
++  }
++
++  void* src_data = nullptr;
++  if (OrtStatus* s = OrtApis::GetTensorMutableData(const_cast<OrtValue*>(src), &src_data)) return s;
++
++  // Copy into a USER-OWNED buffer. AddInitializer requires the weight buffer to
++  // be owned by the caller (OwnsBuffer() must be false) so ORT will not try to
++  // free shared memory and so the same copy can be injected into many sessions.
++  // The caller is responsible for the returned OrtValue's lifetime AND for
++  // freeing the underlying buffer (via free() on the pointer obtained from
++  // GetTensorMutableData) once no session references it any more.
++  const size_t nbytes = elem_count * elem_size;
++  void* user_buf = malloc(nbytes);
++  if (user_buf == nullptr)
++    return OrtApis::CreateStatus(ORT_FAIL, "out of memory copying initializer");
++  memcpy(user_buf, src_data, nbytes);
++
++  OrtMemoryInfo* mem_info = nullptr;
++  if (OrtStatus* s = OrtApis::CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &mem_info)) {
++    free(user_buf);
++    return s;
++  }
++  OrtValue* dst = nullptr;
++  if (OrtStatus* s = OrtApis::CreateTensorWithDataAsOrtValue(mem_info, user_buf, nbytes,
++                                                            dims.data(), dims_count, elem_type, &dst)) {
++    OrtApis::ReleaseMemoryInfo(mem_info);
++    free(user_buf);
++    return s;
++  }
++  OrtApis::ReleaseMemoryInfo(mem_info);
++
++  *out = dst;
++  return nullptr;
++  API_IMPL_END
++}
++
+ ORT_API_STATUS_IMPL(OrtApis::AllocatorAlloc, _Inout_ OrtAllocator* ptr, size_t size, _Outptr_ void** out) {
+   API_IMPL_BEGIN
+   *out = ptr->Alloc(ptr, size);
+@@ -4939,6 +5066,10 @@ static constexpr OrtApi ort_api_1_to_29 = {
+     // End of Version 28 - DO NOT MODIFY ABOVE (see above text for more information)
+ 
+     &OrtApis::SessionOptionsSetWeightlessSourceModelBuffer,
++    // --- Shared-initializer support (custom) ---
++    &OrtApis::SessionGetInitializerCount,
++    &OrtApis::SessionGetInitializerName,
++    &OrtApis::SessionGetInitializer,
+ };
+ 
+ // OrtApiBase can never change as there is no way to know what version of OrtApiBase is returned by OrtGetApiBase.
+diff --git a/onnxruntime/core/session/ort_apis.h b/onnxruntime/core/session/ort_apis.h
+index 550c7d5..3c19d93 100644
+--- a/onnxruntime/core/session/ort_apis.h
++++ b/onnxruntime/core/session/ort_apis.h
+@@ -91,6 +91,16 @@ ORT_API_STATUS_IMPL(SessionGetInputName, _In_ const OrtSession* sess, size_t ind
+ ORT_API_STATUS_IMPL(SessionGetOutputName, _In_ const OrtSession* sess, size_t index, _Inout_ OrtAllocator* allocator, _Outptr_ char** value);
+ ORT_API_STATUS_IMPL(SessionGetOverridableInitializerName, _In_ const OrtSession* sess, size_t index,
+                     _Inout_ OrtAllocator* allocator, _Outptr_ char** value);
++
++// --- Shared-initializer support (custom): extract already-loaded constant
++//     initializers from a session so they can be re-injected via AddInitializer
++//     into other sessions, sharing one copy of the weights in memory. ---
++ORT_API_STATUS_IMPL(SessionGetInitializerCount, _In_ const OrtSession* session, _Out_ size_t* out);
++ORT_API_STATUS_IMPL(SessionGetInitializerName, _In_ const OrtSession* session, size_t index,
++                    _Inout_ OrtAllocator* allocator, _Outptr_ char** output);
++ORT_API_STATUS_IMPL(SessionGetInitializer, _In_ const OrtSession* session, _In_z_ const char* name,
++                    _Outptr_ OrtValue** out);
++
+ ORT_API_STATUS_IMPL(SessionEndProfiling, _In_ OrtSession* sess, _Inout_ OrtAllocator* allocator,
+                     _Outptr_ char** out);
+ ORT_API_STATUS_IMPL(SessionGetModelMetadata, _In_ const OrtSession* sess,
