@@ -81,15 +81,11 @@ FULL_BUILD=0
 # such as HardSwish load. --disable_rtti / --disable_exceptions are kept in both
 # variants: they do not affect operator coverage and match the binary conventions
 # the consumer's cgo binding links against.
-if [ "$FULL_BUILD" -eq 1 ]; then
-    DEFAULT_FLAGS=(--disable_rtti --disable_exceptions)
-    DEFAULT_KV=(--config Release)
-else
-    DEFAULT_FLAGS=(--minimal_build --disable_ml_ops \
-                   --disable_rtti --disable_exceptions)
-    # --key value style defaults
-    DEFAULT_KV=(--config Release --include_ops_by_config "$REQUIRED_OPS_CONFIG")
-fi
+# NOTE: DEFAULT_FLAGS / DEFAULT_KV are NOT selected here. They depend on
+# FULL_BUILD, which is only known after --full is parsed (see the block right
+# after the --full/--minimal_build mutual-exclusion check below). Selecting them
+# up here would always evaluate the minimal branch (FULL_BUILD is still 0), which
+# made --full a silent no-op in earlier revisions.
 # -D style defaults (user values are appended, so they win)
 DEFAULT_CMAKE_DEFINES=(
     onnxruntime_BUILD_SHARED_LIB=OFF
@@ -259,6 +255,19 @@ done
 # re-introduce the operator reduction we are explicitly opting out of.
 if [ "$FULL_BUILD" -eq 1 ] && has_seen "--minimal_build"; then
     die "--full is incompatible with --minimal_build; pick one"
+fi
+
+# Select the default flag / key-value sets now that FULL_BUILD is known. This
+# MUST come after argument parsing: the --full branch is only meaningful once
+# --full has been consumed above.
+if [ "$FULL_BUILD" -eq 1 ]; then
+    DEFAULT_FLAGS=(--disable_rtti --disable_exceptions)
+    DEFAULT_KV=(--config Release)
+else
+    DEFAULT_FLAGS=(--minimal_build --disable_ml_ops \
+                   --disable_rtti --disable_exceptions)
+    # --key value style defaults
+    DEFAULT_KV=(--config Release --include_ops_by_config "$REQUIRED_OPS_CONFIG")
 fi
 
 if [ -z "$TARGET" ]; then
@@ -474,5 +483,5 @@ if [ "$DO_PACKAGE" -eq 1 ]; then
         --dist-dir "$DIST_DIR" \
         --target "$TARGET" \
         --version "$ORT_VERSION" \
-        "${PKG_VARIANT_ARGS[@]}"
+        ${PKG_VARIANT_ARGS[@]+"${PKG_VARIANT_ARGS[@]}"}
 fi
