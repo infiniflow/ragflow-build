@@ -424,9 +424,26 @@ ort_config() {
 
 build_interface_only_deps() {
     local build_dir="$1" bin_dir dep found
-    bin_dir="$(find "$build_dir" -name CMakeCache.txt -print -quit 2>/dev/null)"
+    # The directory passed in is exactly what was handed to `build.py
+    # --build_dir`, i.e. the top-level onnxruntime CMake build directory where
+    # the main CMakeCache.txt lives and every top-level target (including the
+    # FetchContent `re2` target) is defined. A naive
+    # `find "$build_dir" -name CMakeCache.txt -print -quit` is dangerous here:
+    # the FetchContent subbuild dirs under _deps/*-subbuild/ also carry a
+    # CMakeCache.txt, and because they sort before the top-level one ("_" < "C")
+    # find reports a subbuild directory first. Running `cmake --build <subbuild>
+    # --target re2` there fails with "unknown target 're2'", which the trailing
+    # `|| echo warning` happily swallows, so libre2.a is never built and the
+    # final link dies with "undefined reference to re2::RE2::*". Prefer the
+    # top-level cache (a direct child of build_dir); only fall back to a search
+    # that excludes the _deps subbuild caches.
+    if [ -f "$build_dir/CMakeCache.txt" ]; then
+        bin_dir="$build_dir"
+    else
+        bin_dir="$(find "$build_dir" -name CMakeCache.txt -not -path '*/_deps/*' -print -quit 2>/dev/null)"
+        bin_dir="$(dirname "$bin_dir")"
+    fi
     [ -n "$bin_dir" ] || return 0
-    bin_dir="$(dirname "$bin_dir")"
     for dep in "${MISSING_INTERFACE_DEPS[@]}"; do
         found="$(find "$build_dir" \( -name "lib${dep}.a" -o -name "${dep}.lib" \) -print -quit 2>/dev/null)"
         [ -n "$found" ] && continue
