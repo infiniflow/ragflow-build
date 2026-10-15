@@ -261,7 +261,13 @@ fi
 # MUST come after argument parsing: the --full branch is only meaningful once
 # --full has been consumed above.
 if [ "$FULL_BUILD" -eq 1 ]; then
-    DEFAULT_FLAGS=(--disable_rtti --disable_exceptions)
+    # Standard full build: complete operator set, and RTTI / exceptions left at
+    # ONNX Runtime's defaults. Do NOT pass --disable_exceptions here: build.py
+    # hard-rejects "--disable_exceptions" unless --minimal_build is also given,
+    # and the whole point of --full is to drop --minimal_build. We also omit
+    # --disable_rtti so the full archive matches the stock ONNX Runtime ABI
+    # (RTTI + exceptions on) that the consumer's CGO link expects.
+    DEFAULT_FLAGS=()
     DEFAULT_KV=(--config Release)
 else
     DEFAULT_FLAGS=(--minimal_build --disable_ml_ops \
@@ -379,7 +385,16 @@ ORT_ARGS+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
 # per target build
 # ---------------------------------------------------------------------------
 if [ "$EXPLICIT_BUILD_ROOT" -eq 0 ]; then
-    BUILD_DIR="$BUILD_ROOT/$TARGET"
+    # The minimal and full variants must NOT share a build directory: they feed
+    # ONNX Runtime's build.py different flags, and a leftover CMake cache from
+    # the other variant makes the later build silently reuse the wrong operator
+    # set (e.g. a "full" build that actually produces a minimal .a). Keep them
+    # in separate dirs.
+    if [ "$FULL_BUILD" -eq 1 ]; then
+        BUILD_DIR="$BUILD_ROOT/${TARGET}-full"
+    else
+        BUILD_DIR="$BUILD_ROOT/$TARGET"
+    fi
 else
     BUILD_DIR="$BUILD_ROOT"
 fi
