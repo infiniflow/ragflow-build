@@ -54,6 +54,14 @@ DO_CLEAN=0
 DO_PACKAGE=1
 EXPLICIT_BUILD_ROOT=0
 JOBS=""
+# Full operator-set build (the "-full" variant). Off by default: the published
+# default is a minimal build (--minimal_build + --include_ops_by_config reduced to
+# required_operators.config) that cannot load .onnx models containing contrib ops
+# such as HardSwish. --full drops --minimal_build / --include_ops_by_config /
+# --disable_ml_ops so the library carries the complete operator set and can load
+# the EE DeepDoc weights (e.g. rec.ee.cpu.onnx). The SessionGetInitializer patch
+# is applied independently by scripts/init-submodules.sh.
+FULL_BUILD=0
 
 # --- defaults requested by this project ------------------------------------
 # store_true style flags that are ON unless the user passes them explicitly
@@ -66,10 +74,22 @@ JOBS=""
 # "Could not find an implementation for FusedConv(1)". Operator coverage is
 # narrowed by the allow list in required_operators.config instead, which keeps
 # those kernels while still excluding everything the models do not use.
-DEFAULT_FLAGS=(--minimal_build --disable_ml_ops \
-               --disable_rtti --disable_exceptions)
-# --key value style defaults
-DEFAULT_KV=(--config Release --include_ops_by_config "$REQUIRED_OPS_CONFIG")
+#
+# The minimal (default) build reduces to the allow list and disables ML ops.
+# The --full build keeps the complete operator set (no --minimal_build, no
+# --include_ops_by_config, ML ops enabled) so .onnx models with contrib ops
+# such as HardSwish load. --disable_rtti / --disable_exceptions are kept in both
+# variants: they do not affect operator coverage and match the binary conventions
+# the consumer's cgo binding links against.
+if [ "$FULL_BUILD" -eq 1 ]; then
+    DEFAULT_FLAGS=(--disable_rtti --disable_exceptions)
+    DEFAULT_KV=(--config Release)
+else
+    DEFAULT_FLAGS=(--minimal_build --disable_ml_ops \
+                   --disable_rtti --disable_exceptions)
+    # --key value style defaults
+    DEFAULT_KV=(--config Release --include_ops_by_config "$REQUIRED_OPS_CONFIG")
+fi
 # -D style defaults (user values are appended, so they win)
 DEFAULT_CMAKE_DEFINES=(
     onnxruntime_BUILD_SHARED_LIB=OFF
@@ -112,6 +132,11 @@ Project options:
   --update              Run 'git submodule update --init --recursive' first.
   --clean               Delete the build directory for this target first.
   --no-package          Build only, do not create a tarball/zip in --dist-dir.
+  --full                Full operator-set build (the "-full" variant): no
+                          --minimal_build / --include_ops_by_config / --disable_ml_ops.
+                          Produces a static library that can load .onnx models with
+                          contrib ops such as HardSwish (required by the EE DeepDoc
+                          weights). Incompatible with --minimal_build.
   -h, --help            Show this help.
 
 Default onnxruntime options (skipped when you pass them yourself):
@@ -206,6 +231,7 @@ while [ $# -gt 0 ]; do
         --clean)    DO_CLEAN=1; shift ;;
         --package)  DO_PACKAGE=1; shift ;;
         --no-package) DO_PACKAGE=0; shift ;;
+        --full)     FULL_BUILD=1; shift ;;
         -h|--help)  usage; exit 0 ;;
         --cmake_extra_defines)
             [ $# -ge 2 ] || die "--cmake_extra_defines requires a value"
@@ -228,6 +254,12 @@ while [ $# -gt 0 ]; do
             USER_ARGS+=("$1"); shift ;;
     esac
 done
+
+# --full and --minimal_build are mutually exclusive: --minimal_build would
+# re-introduce the operator reduction we are explicitly opting out of.
+if [ "$FULL_BUILD" -eq 1 ] && has_seen "--minimal_build"; then
+    die "--full is incompatible with --minimal_build; pick one"
+fi
 
 if [ -z "$TARGET" ]; then
     TARGET="$(detect_target)"
@@ -431,11 +463,16 @@ info "build finished: $BUILD_DIR"
 # ---------------------------------------------------------------------------
 # packaging
 # ---------------------------------------------------------------------------
+PKG_VARIANT_ARGS=()
+if [ "$FULL_BUILD" -eq 1 ]; then
+    PKG_VARIANT_ARGS=(--variant full)
+fi
 if [ "$DO_PACKAGE" -eq 1 ]; then
     bash "$SCRIPT_DIR/package.sh" \
         --source "$ORT_SRC" \
         --build-dir "$BUILD_DIR" \
         --dist-dir "$DIST_DIR" \
         --target "$TARGET" \
-        --version "$ORT_VERSION"
+        --version "$ORT_VERSION" \
+        "${PKG_VARIANT_ARGS[@]}"
 fi

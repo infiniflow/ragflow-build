@@ -22,6 +22,7 @@ BUILD_DIR=""
 DIST_DIR=""
 TARGET=""
 VERSION=""
+VARIANT="minimal"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -30,6 +31,7 @@ while [ $# -gt 0 ]; do
         --dist-dir)  DIST_DIR="$2"; shift 2 ;;
         --target)    TARGET="$2"; shift 2 ;;
         --version)   VERSION="$2"; shift 2 ;;
+        --variant)   VARIANT="$2"; shift 2 ;;
         -h|--help)   sed -n '2,25p' "$0"; exit 0 ;;
         *)           echo "error: unknown option $1" >&2; exit 1 ;;
     esac
@@ -55,7 +57,14 @@ if [ -d "$BUILD_DIR/universal" ]; then
     PICK_DIR="$BUILD_DIR/universal"
 fi
 
-PKG_NAME="onnxruntime-${VERSION}-${TARGET}"
+# The "-full" variant carries the complete operator set (see build.sh --full) and
+# is named onnxruntime-<version>-full-<target>; the default "minimal" build keeps
+# the historical onnxruntime-<version>-<target> name.
+if [ "$VARIANT" = "full" ]; then
+    PKG_NAME="onnxruntime-${VERSION}-full-${TARGET}"
+else
+    PKG_NAME="onnxruntime-${VERSION}-${TARGET}"
+fi
 STAGE_DIR="$DIST_DIR/$PKG_NAME"
 
 echo "==> packaging $PKG_NAME from $PICK_DIR"
@@ -314,31 +323,47 @@ merge_libs "$STAGE_DIR/lib/$LIB_NAME" "${ORDERED[@]}"
 # --- metadata ----------------------------------------------------------------
 [ -f "$SOURCE_DIR/LICENSE" ] && cp -f "$SOURCE_DIR/LICENSE" "$STAGE_DIR/LICENSE"
 
-cat > "$STAGE_DIR/BUILD_INFO.txt" <<EOF
-project       : onnxruntime custom static build
-version       : ${VERSION}
-target        : ${TARGET}
-build host    : $(uname -s) $(uname -m)
-build date    : $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-source commit : $(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
+{
+    echo "project       : onnxruntime custom static build"
+    echo "version       : ${VERSION}"
+    echo "target        : ${TARGET}"
+    echo "variant       : ${VARIANT}"
+    echo "build host    : $(uname -s) $(uname -m)"
+    echo "build date    : $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "source commit : $(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo
 
-configuration :
-  Release / static library (onnxruntime_BUILD_SHARED_LIB=OFF)
-  --minimal_build
-  --disable_ml_ops
-  --disable_rtti
-  --disable_exceptions
-  --include_ops_by_config required_operators.config
-  (contrib ops stay enabled: the DeepDoc weights need the com.microsoft
-   fused kernels - FusedConv, FusedMatMul, QuickGelu)
+    if [ "$VARIANT" = "full" ]; then
+        echo "configuration :"
+        echo "  Release / static library (onnxruntime_BUILD_SHARED_LIB=OFF)"
+        echo "  full operator set: no --minimal_build, no --include_ops_by_config,"
+        echo "  ML ops enabled. Supports .onnx models that use contrib ops such as"
+        echo "  HardSwish (required by the EE DeepDoc weights, e.g. rec.ee.cpu.onnx)."
+        echo "  --disable_rtti"
+        echo "  --disable_exceptions"
+        echo "  (contrib ops stay enabled: the DeepDoc weights need the com.microsoft"
+        echo "   fused kernels - FusedConv, FusedMatMul, QuickGelu)"
+    else
+        echo "configuration :"
+        echo "  Release / static library (onnxruntime_BUILD_SHARED_LIB=OFF)"
+        echo "  --minimal_build"
+        echo "  --disable_ml_ops"
+        echo "  --disable_rtti"
+        echo "  --disable_exceptions"
+        echo "  --include_ops_by_config required_operators.config"
+        echo "  (contrib ops stay enabled: the DeepDoc weights need the com.microsoft"
+        echo "   fused kernels - FusedConv, FusedMatMul, QuickGelu)"
+    fi
+    echo
 
-contents      :
-  include/  public C/C++ headers (flattened, same layout as upstream packages)
-  lib/      single fat static library built from ${#ORDERED[@]} archives
+    echo "contents      :"
+    echo "  include/  public C/C++ headers (flattened, same layout as upstream packages)"
+    echo "  lib/      single fat static library built from ${#ORDERED[@]} archives"
+    echo
 
-usage         :
-  g++ app.cc -I<pkg>/include <pkg>/lib/${LIB_NAME} -lpthread -ldl -lm -o app
-EOF
+    echo "usage         :"
+    echo "  g++ app.cc -I<pkg>/include <pkg>/lib/${LIB_NAME} -lpthread -ldl -lm -o app"
+} > "$STAGE_DIR/BUILD_INFO.txt"
 
 # --- archive -----------------------------------------------------------------
 mkdir -p "$DIST_DIR"
