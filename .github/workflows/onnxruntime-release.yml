@@ -106,17 +106,11 @@ jobs:
           - target: linux-aarch64
             variant: minimal
             os: ubuntu-24.04-arm
-          # "-full" variant: complete operator set (see build.sh --full), built
-          # from the same source + vendored patches as the minimal build. Required
-          # to load .onnx models with contrib ops such as HardSwish (EE DeepDoc
-          # weights). Full builds compile every operator and take far longer, hence
-          # the 720-minute job timeout.
-          - target: linux-x86_64
-            variant: full
-            os: ubuntu-22.04
-          - target: linux-aarch64
-            variant: full
-            os: ubuntu-24.04-arm
+          # Only the "minimal" variant is built: DeepDoc weights ship as .ort
+          # with HardSwish decomposed to Mul/Clip/Div, so no consumer needs the
+          # full operator set. (The -full variant was removed 2026-10-16 —
+          # vanilla ORT has no HardSwish CPU kernel, so its smoke test could
+          # never pass.)
           - target: osx-arm64
             variant: minimal
             os: macos-latest
@@ -179,21 +173,18 @@ jobs:
           echo "${{ needs.prepare.outputs.base_version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"
           bash "${{ env.ORT_PKG }}/scripts/init-submodules.sh"
 
-      - name: Build ${{ matrix.target }}${{ matrix.variant == 'full' && ' (full)' || '' }}
+      - name: Build ${{ matrix.target }}
         shell: bash
         run: |
           # Equivalent to:
           #   --config Release
           #   --cmake_extra_defines onnxruntime_BUILD_SHARED_LIB=OFF
-          #   --minimal_build --disable_ml_ops --disable_rtti --disable_exceptions   (minimal)
-          #   --parallel --include_ops_by_config onnxruntime/required_operators.config  (minimal)
-          # The "full" variant (--full) drops --minimal_build /
-          # --include_ops_by_config / --disable_ml_ops for the complete operator set,
-          # so .onnx models with contrib ops such as HardSwish load.
+          #   --minimal_build --disable_ml_ops --disable_rtti --disable_exceptions
+          #   --parallel --include_ops_by_config onnxruntime/required_operators.config
           #
           # --disable_contrib_ops is intentionally NOT used: the DeepDoc weights
           # need the com.microsoft fused kernels listed in that config.
-          bash "${{ env.ORT_PKG }}/build.sh" --target "${{ matrix.target }}" ${{ matrix.variant == 'full' && '--full' || '' }}
+          bash "${{ env.ORT_PKG }}/build.sh" --target "${{ matrix.target }}"
 
       - name: Smoke test (load the DeepDoc models)
         # A build that compiles fine can still be unable to load the models it
@@ -268,83 +259,13 @@ jobs:
           fi
           echo "all DeepDoc models loaded"
 
-      - name: Smoke test (full build loads .onnx with HardSwish)
-        # Only the "-full" build carries the complete operator set. Generate a tiny
-        # HardSwish .onnx and create a session for it; a minimal build would fail
-        # with "Could not find an implementation for HardSwish", which is exactly
-        # the failure the EE DeepDoc weights (e.g. rec.ee.cpu.onnx) hit.
-        if: matrix.variant == 'full'
-        shell: bash
-        run: |
-          set -euo pipefail
-          pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
-          [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
-
-          work="$(mktemp -d)"
-          unzip -q "$zip_path" -d "$work"
-          lib_dir="$(find "$work" -type d -name lib -print -quit)"
-          [ -n "$lib_dir" ] || { echo "::error::no lib/ directory in $zip_path"; exit 1; }
-          root="$(dirname "$lib_dir")"
-          [ -f "$root/lib/libonnxruntime.a" ] || { echo "::error::libonnxruntime.a missing"; exit 1; }
-
-          if ! strings "$root/lib/libonnxruntime.a" | grep -q HardSwish; then
-            echo "::error::libonnxruntime.a does not contain HardSwish"
-            exit 1
-          fi
-
-          python -m pip install --quiet onnx
-          HSWISH="$work/hswish.onnx" python - <<'PY'
-          import onnx, os
-          from onnx import helper as h, TensorProto as TP
-          X = h.make_tensor_value_info('X', TP.FLOAT, [1, 3, 4, 4])
-          Y = h.make_tensor_value_info('Y', TP.FLOAT, [1, 3, 4, 4])
-          node = h.make_node('HardSwish', ['X'], ['Y'])
-          g = h.make_graph([node], 'hswish', [X], [Y])
-          m = h.make_model(g, opset_imports=[h.make_opsetid('', 14)])
-          onnx.save(m, os.environ['HSWISH'])
-          PY
-
-          cat > "$work/probe.c" <<'EOF'
-          #include <stdio.h>
-          #include "onnxruntime_c_api.h"
-          int main(int argc, char **argv) {
-              const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
-              OrtEnv *env = NULL; OrtSessionOptions *so = NULL; OrtSession *s = NULL;
-              if (api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "smoke", &env) != NULL) return 2;
-              if (api->CreateSessionOptions(&so) != NULL) return 2;
-              OrtStatus *st = api->CreateSession(env, argv[1], so, &s);
-              if (st != NULL) {
-                  fprintf(stderr, "FAIL %s: %s\n", argv[1], api->GetErrorMessage(st));
-                  return 1;
-              }
-              printf("ok   %s\n", argv[1]);
-              return 0;
-          }
-          EOF
-
-          cxx="${CXX:-c++}"
-          if [ "$(uname -s)" = "Darwin" ]; then
-            libs="-lc++ -lpthread -lm -framework CoreFoundation -framework Foundation -framework Security"
-          else
-            libs="-lpthread -ldl -lm"
-          fi
-          "$cxx" -O0 -o "$work/probe" "$work/probe.c" -I"$root/include" \
-              "$root/lib/libonnxruntime.a" $libs
-
-          "$work/probe" "$work/hswish.onnx" || {
-            echo "::error::the full build cannot load a HardSwish .onnx"
-            exit 1
-          }
-          echo "full build loads .onnx with HardSwish"
-
       - name: Verify shared-initializer APIs (linux-x86_64)
         # The shipped static lib must expose the custom shared-initializer APIs
         # (SessionGetInitializer*) and shared-weight inference must work end to
         # end. Build tools/verify_shared_weights/verify.cpp against the packaged
         # archive and run it on a DeepDoc weight. Fails the release if the
         # vendored patch did not make it into the built library.
-        if: matrix.target == 'linux-x86_64' || (matrix.variant == 'full' && matrix.target == 'linux-aarch64')
+        if: matrix.target == 'linux-x86_64'
         shell: bash
         env:
           HF_ENDPOINT: https://huggingface.co
@@ -434,13 +355,10 @@ jobs:
           version="${{ needs.prepare.outputs.version }}"
 
           platform_of() {
-            local t="$1" full=""
+            local t="$1"
             case "$t" in
-              full-*) full=" (full)"; t="${t#full-}" ;;
-            esac
-            case "$t" in
-              linux-x86_64)  echo "Linux / x86_64${full}" ;;
-              linux-aarch64) echo "Linux / aarch64${full}" ;;
+              linux-x86_64)  echo "Linux / x86_64" ;;
+              linux-aarch64) echo "Linux / aarch64" ;;
               osx-arm64)     echo "macOS / arm64" ;;
               osx-x86_64)    echo "macOS / x86_64" ;;
               osx-universal) echo "macOS / arm64 + x86_64" ;;
@@ -453,18 +371,13 @@ jobs:
           {
             echo "Customized **static** onnxruntime ${version} build."
             echo
-            echo "Two variants are published for each Linux target:"
+            echo "A single **minimal** build is published per target:"
             echo
             echo "- \`onnxruntime-${version}-<target>.zip\` — the **minimal** build:"
             echo "  \`--minimal_build --disable_ml_ops --disable_rtti --disable_exceptions\`,"
             echo "  reduced to the operators in \`required_operators.config\`"
             echo "  (\`--include_ops_by_config\`). Loads \`.ort\` models. Contrib ops stay enabled"
             echo "  because the DeepDoc weights need the \`com.microsoft\` fused kernels."
-            echo "- \`onnxruntime-${version}-full-<target>.zip\` — the **full** build:"
-            echo "  complete operator set (no \`--minimal_build\` / \`--include_ops_by_config\`,"
-            echo "  ML ops enabled). Loads \`.onnx\` models that use contrib ops such as"
-            echo "  HardSwish (\`ONNX format model is not supported in this build\` under the"
-            echo "  minimal build) — required by the EE DeepDoc weights, e.g. \`rec.ee.cpu.onnx\`."
             echo
             echo "Upstream ships shared libraries only, hence this repo."
             echo
@@ -514,12 +427,6 @@ jobs:
             echo "unzip onnxruntime-${version}-linux-x86_64.zip"
             echo "g++ app.cc -I onnxruntime-${version}-linux-x86_64/include \\"
             echo "    onnxruntime-${version}-linux-x86_64/lib/libonnxruntime.a \\"
-            echo "    -lpthread -ldl -lm -o app"
-            echo
-            echo "# full (loads .onnx with contrib ops such as HardSwish):"
-            echo "unzip onnxruntime-${version}-full-linux-x86_64.zip"
-            echo "g++ app.cc -I onnxruntime-${version}-full-linux-x86_64/include \\"
-            echo "    onnxruntime-${version}-full-linux-x86_64/lib/libonnxruntime.a \\"
             echo "    -lpthread -ldl -lm -o app"
             echo '```'
             echo
