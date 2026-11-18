@@ -57,11 +57,15 @@ if [ -d "$BUILD_DIR/universal" ]; then
     PICK_DIR="$BUILD_DIR/universal"
 fi
 
-# The "-full" variant carries the complete operator set (see build.sh --full) and
-# is named onnxruntime-<version>-full-<target>; the default "minimal" build keeps
-# the historical onnxruntime-<version>-<target> name.
+# The "-full" variant carries the complete operator set (see build.sh --full)
+# and the "-cuda" variant adds the CUDA Execution Provider on top of full
+# (see build.sh --cuda); they are named onnxruntime-<version>-full-<target> and
+# onnxruntime-<version>-cuda-<target>. The default "minimal" build keeps the
+# historical onnxruntime-<version>-<target> name.
 if [ "$VARIANT" = "full" ]; then
     PKG_NAME="onnxruntime-${VERSION}-full-${TARGET}"
+elif [ "$VARIANT" = "cuda" ]; then
+    PKG_NAME="onnxruntime-${VERSION}-cuda-${TARGET}"
 else
     PKG_NAME="onnxruntime-${VERSION}-${TARGET}"
 fi
@@ -121,6 +125,43 @@ while IFS= read -r header; do
     found_noexc=$((found_noexc + 1))
 done < <(find "$STAGE_DIR/include" -type f \( -name '*.h' -o -name '*.inc' \) | sort)
 echo "==> neutralized NO_EXCEPTION in $found_noexc header files"
+
+# --- CUDA EP provider archive ------------------------------------------------
+# ONNX Runtime links the CUDA EP as a MODULE .so (libonnxruntime_providers_cuda.so)
+# even when onnxruntime_BUILD_SHARED_LIB=OFF, so there is no
+# libonnxruntime_providers_cuda.a for the fat-archive merge below. Re-archive the
+# already-compiled CUDA provider objects so the single libonnxruntime.a carries
+# runnable CUDA kernels instead of only the EP registration shell.
+#
+# This is a no-op for minimal/no-CUDA builds (no CUDA object dirs exist). The
+# resulting archive is named libonnxruntime.a (no "cuda" in the filename) and is
+# placed at the build root, NOT under CMakeFiles/, so the FOUND_LIBS find below
+# picks it up while check_onnxruntime_deps' *cuda* filename filter stays intact.
+if [ "${CUDA_EP_BUILD:-0}" = "1" ]; then
+    CUDA_OBJ_DIRS=(
+        "$BUILD_DIR/Release/CMakeFiles/onnxruntime_providers_cuda.dir"
+        "$BUILD_DIR/Release/CMakeFiles/onnxruntime_providers_cuda_flash_attention.dir"
+        "$BUILD_DIR/Release/CMakeFiles/onnxruntime_providers_cuda_sm90_tma.dir"
+        "$BUILD_DIR/Release/CMakeFiles/onnxruntime_providers_cuda_sm120_tma.dir"
+        "$BUILD_DIR/Release/CMakeFiles/onnxruntime_providers_cuda_llm.dir"
+    )
+    CUDA_OBJS=()
+    for cuda_dir in "${CUDA_OBJ_DIRS[@]}"; do
+        [ -d "$cuda_dir" ] || continue
+        while IFS= read -r -d '' obj; do
+            CUDA_OBJS+=("$obj")
+        done < <(find "$cuda_dir" -name '*.o' -print0 2>/dev/null)
+    done
+    if [ ${#CUDA_OBJS[@]} -gt 0 ]; then
+        CUDA_A="$BUILD_DIR/libonnxruntime_providers_cuda.a"
+        rm -f "$CUDA_A"
+        printf '%s\0' "${CUDA_OBJS[@]}" | xargs -0 -r ar qc "$CUDA_A"
+        echo "==> re-archived ${#CUDA_OBJS[@]} CUDA objects into $CUDA_A"
+    else
+        echo "error: CUDA_EP_BUILD=1 but no CUDA provider objects found under $BUILD_DIR" >&2
+        exit 1
+    fi
+fi
 
 # --- collect every static library --------------------------------------------
 # Includes the third party deps CMake builds under _deps/; only object dirs are
@@ -212,6 +253,7 @@ ORDER=(
     onnxruntime_session
     onnxruntime_optimizer
     onnxruntime_providers
+    onnxruntime_providers_cuda
     onnxruntime_lora
     onnxruntime_framework
     onnxruntime_graph
@@ -343,6 +385,15 @@ merge_libs "$STAGE_DIR/lib/$LIB_NAME" "${ORDERED[@]}"
         echo "  --disable_exceptions"
         echo "  (contrib ops stay enabled: the DeepDoc weights need the com.microsoft"
         echo "   fused kernels - FusedConv, FusedMatMul, QuickGelu)"
+    elif [ "$VARIANT" = "cuda" ]; then
+        echo "configuration :"
+        echo "  Release / static library (onnxruntime_BUILD_SHARED_LIB=OFF)"
+        echo "  full operator set + CUDA Execution Provider (--use_cuda)."
+        echo "  CUDA provider objects re-archived into the fat libonnxruntime.a"
+        echo "  so no separate provider .so is needed at runtime. CUDA runtime"
+        echo "  libraries (libcudart/libcublas/libcudnn) are supplied by the consumer."
+        echo "  CPU EP, com.microsoft fused kernels and the shared-initializer C APIs"
+        echo "  are retained: the archive is a strict superset of the minimal build."
     else
         echo "configuration :"
         echo "  Release / static library (onnxruntime_BUILD_SHARED_LIB=OFF)"

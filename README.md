@@ -89,6 +89,45 @@ Build trees are platform specific: `onnxruntime/build/<target>` for most
 targets, and `onnxruntime/build/osx-universal/{arm64,x86_64,universal}` for the
 universal build.
 
+#### CUDA EP variant (`--cuda`)
+
+The default build is CPU-only: `--minimal_build` drops the CUDA Execution
+Provider. To produce a static library that can run DeepDoc inference on NVIDIA
+GPUs, build the CUDA variant:
+
+```bash
+cd onnxruntime
+export CUDA_HOME=/usr/local/cuda          # CUDA 12.x toolkit (nvcc + libs)
+export CUDNN_HOME=/usr/lib/x86_64-linux-gnu  # cuDNN 9.x headers + libs
+./build.sh --target linux-x86_64 --cuda \
+    --cmake_extra_defines onnxruntime_CUDA_COMPUTE_CAPABILITIES=8.6
+```
+
+`--cuda` implies `--full` (ORT 1.29.0 cannot combine `--minimal_build` with
+`--use_cuda`: `onnxruntime_providers_shared` is only created for non-minimal
+builds but the CUDA provider depends on it), enables `--use_cuda`, and derives
+`--cuda_home` / `--cudnn_home` from the env vars above.
+
+**Why a re-archive step**: ORT links the CUDA EP as a MODULE
+`libonnxruntime_providers_cuda.so` even when `onnxruntime_BUILD_SHARED_LIB=OFF`,
+so there is no `.a` for the fat-archive merge. `package.sh` re-archives the
+compiled CUDA provider objects into `libonnxruntime_providers_cuda.a` and adds
+it to the merge order, so the single published `libonnxruntime.a` carries
+runnable CUDA kernels and **no provider `.so` is needed at runtime**. The CUDA
+runtime libraries (`libcudart`, `libcublas`, `libcudnn`) are still supplied by
+the consuming linker — that is a normal CUDA program requirement.
+
+The CUDA archive is a strict superset of the minimal build: the CPU EP, the
+`com.microsoft` fused kernels (`FusedConv`, ...), and the shared-initializer C
+APIs (`SessionGetInitializer*`) are all retained, so CPU-only and OSS in-memory
+inference remain unaffected. Expect a much larger archive (~846 MB vs ~48 MB
+minimal): most of the extra size is FlashAttention/LLM kernels that DeepDoc does
+not use; trimming those is a future optimization.
+
+Artifact: `onnxruntime-<version>-cuda-<target>.zip`. CI publishes it only from a
+self-hosted `cuda` runner via `workflow_dispatch` with `build_cuda=true` (see
+"Releasing").
+
 ### 3. Artifacts
 
 `onnxruntime/dist/onnxruntime-<version>-<target>.zip` plus a `.sha256` file.

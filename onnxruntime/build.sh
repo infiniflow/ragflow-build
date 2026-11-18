@@ -62,6 +62,12 @@ JOBS=""
 # the EE DeepDoc weights (e.g. rec.ee.cpu.onnx). The SessionGetInitializer patch
 # is applied independently by scripts/init-submodules.sh.
 FULL_BUILD=0
+# CUDA EP build (the "-cuda" variant). Implies --full: ORT 1.29.0 cannot combine
+# --minimal_build with --use_cuda (onnxruntime_providers_shared target is only
+# created for non-minimal builds but the CUDA provider depends on it), so the
+# CUDA variant carries the complete operator set plus the CUDA EP, and
+# package.sh re-archives the CUDA provider objects into libonnxruntime.a.
+CUDA_BUILD=0
 
 # --- defaults requested by this project ------------------------------------
 # store_true style flags that are ON unless the user passes them explicitly
@@ -133,6 +139,12 @@ Project options:
                           Produces a static library that can load .onnx models with
                           contrib ops such as HardSwish (required by the EE DeepDoc
                           weights). Incompatible with --minimal_build.
+  --cuda                CUDA EP build (the "-cuda" variant): implies --full and
+                          enables --use_cuda. Pass --cuda_version / --cuda_home /
+                          --cudnn_home (or set CUDA_HOME / CUDNN_HOME env vars).
+                          The CUDA provider is re-archived into the single
+                          libonnxruntime.a by package.sh; no provider .so is needed
+                          at runtime. Incompatible with --minimal_build.
   -h, --help            Show this help.
 
 Default onnxruntime options (skipped when you pass them yourself):
@@ -228,6 +240,7 @@ while [ $# -gt 0 ]; do
         --package)  DO_PACKAGE=1; shift ;;
         --no-package) DO_PACKAGE=0; shift ;;
         --full)     FULL_BUILD=1; shift ;;
+        --cuda)     CUDA_BUILD=1; FULL_BUILD=1; shift ;;
         -h|--help)  usage; exit 0 ;;
         --cmake_extra_defines)
             [ $# -ge 2 ] || die "--cmake_extra_defines requires a value"
@@ -250,6 +263,22 @@ while [ $# -gt 0 ]; do
             USER_ARGS+=("$1"); shift ;;
     esac
 done
+
+# When --cuda is requested, inject the CUDA EP switch (and derive toolchain
+# paths from CUDA_HOME / CUDNN_HOME when the caller did not pass them explicitly).
+# These go into USER_ARGS so build.py sees them verbatim; mark_seen prevents a
+# duplicate if the caller already supplied the same flag.
+if [ "$CUDA_BUILD" -eq 1 ]; then
+    if ! has_seen "--use_cuda"; then
+        USER_ARGS+=(--use_cuda); mark_seen "--use_cuda"
+    fi
+    if ! has_seen "--cuda_home" && [ -n "${CUDA_HOME:-}" ]; then
+        USER_ARGS+=(--cuda_home "$CUDA_HOME"); mark_seen "--cuda_home"
+    fi
+    if ! has_seen "--cudnn_home" && [ -n "${CUDNN_HOME:-}" ]; then
+        USER_ARGS+=(--cudnn_home "$CUDNN_HOME"); mark_seen "--cudnn_home"
+    fi
+fi
 
 # --full and --minimal_build are mutually exclusive: --minimal_build would
 # re-introduce the operator reduction we are explicitly opting out of.
@@ -390,7 +419,9 @@ if [ "$EXPLICIT_BUILD_ROOT" -eq 0 ]; then
     # the other variant makes the later build silently reuse the wrong operator
     # set (e.g. a "full" build that actually produces a minimal .a). Keep them
     # in separate dirs.
-    if [ "$FULL_BUILD" -eq 1 ]; then
+    if [ "$CUDA_BUILD" -eq 1 ]; then
+        BUILD_DIR="$BUILD_ROOT/${TARGET}-cuda"
+    elif [ "$FULL_BUILD" -eq 1 ]; then
         BUILD_DIR="$BUILD_ROOT/${TARGET}-full"
     else
         BUILD_DIR="$BUILD_ROOT/$TARGET"
@@ -505,10 +536,17 @@ info "build finished: $BUILD_DIR"
 # packaging
 # ---------------------------------------------------------------------------
 PKG_VARIANT_ARGS=()
-if [ "$FULL_BUILD" -eq 1 ]; then
+if [ "$CUDA_BUILD" -eq 1 ]; then
+    PKG_VARIANT_ARGS=(--variant cuda)
+elif [ "$FULL_BUILD" -eq 1 ]; then
     PKG_VARIANT_ARGS=(--variant full)
 fi
 if [ "$DO_PACKAGE" -eq 1 ]; then
+    # CUDA_EP_BUILD tells package.sh to re-archive the compiled CUDA provider
+    # objects into the fat archive (no provider .so needed at runtime).
+    if [ "$CUDA_BUILD" -eq 1 ]; then
+        export CUDA_EP_BUILD=1
+    fi
     bash "$SCRIPT_DIR/package.sh" \
         --source "$ORT_SRC" \
         --build-dir "$BUILD_DIR" \

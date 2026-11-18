@@ -26,6 +26,10 @@ on:
         description: 'Publish the release as a draft'
         type: boolean
         default: true
+      build_cuda:
+        description: 'Also build the CUDA EP variant (needs a self-hosted cuda runner)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -327,6 +331,86 @@ jobs:
           path: |
             ${{ env.ORT_PKG }}/dist/*.zip
             ${{ env.ORT_PKG }}/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  build-cuda:
+    name: build CUDA EP (linux-x86_64)
+    # The CUDA EP variant needs a CUDA 12.x toolkit + cuDNN 9 at build time.
+    # GitHub-hosted runners do not ship those, so this job targets a self-hosted
+    # runner labelled `cuda` (see README "CUDA EP variant"). It is opt-in via a
+    # `workflow_dispatch` input so it never blocks the minimal release builds.
+    needs: prepare
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_cuda == true }}
+    runs-on: [self-hosted, linux, cuda]
+    timeout-minutes: 720
+    env:
+      CUDA_HOME: /usr/local/cuda
+      CUDNN_HOME: /usr/lib/x86_64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build deps
+        run: python -m pip install --upgrade pip "cmake>=3.28" flatbuffers ninja
+
+      - name: Verify CUDA toolchain
+        run: |
+          set -euo pipefail
+          "$CUDA_HOME/bin/nvcc" --version
+          test -f "$CUDNN_HOME/cudnn.h" || test -f /usr/include/x86_64-linux-gnu/cudnn.h
+          echo "CUDA_HOME=$CUDA_HOME CUDNN_HOME=$CUDNN_HOME"
+
+      - name: Fetch onnxruntime ${{ needs.prepare.outputs.base_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ needs.prepare.outputs.base_version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"
+          bash "${{ env.ORT_PKG }}/scripts/init-submodules.sh"
+
+      - name: Build CUDA EP static lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --cuda implies --full (ORT 1.29.0 cannot combine minimal + CUDA),
+          # enables --use_cuda, derives --cuda_home/--cudnn_home from the env
+          # above, and package.sh re-archives the CUDA provider objects into a
+          # single libonnxruntime.a (no provider .so at runtime).
+          bash "${{ env.ORT_PKG }}/build.sh" \
+            --target linux-x86_64 \
+            --cuda \
+            --jobs 4 \
+            --cmake_extra_defines onnxruntime_CUDA_COMPUTE_CAPABILITIES=8.6
+
+      - name: Verify CUDA symbols in the fat archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip_path="$(ls "${{ env.ORT_PKG }}"/dist/*cuda*.zip | head -1)"
+          work="$(mktemp -d)"; unzip -q "$zip_path" -d "$work"
+          a_path="$(find "$work" -type f -name libonnxruntime.a -print -quit)"
+          [ -n "$a_path" ] || { echo "::error::libonnxruntime.a missing"; exit 1; }
+          nm -C "$a_path" | grep -q 'CudaProviderFactoryCreator' \
+            || { echo "::error::CUDA EP factory missing"; exit 1; }
+          nm -C "$a_path" | grep -q 'onnxruntime::contrib::cuda' \
+            || { echo "::error::CUDA kernels missing"; exit 1; }
+          nm -C "$a_path" | grep -q 'SessionGetInitializer' \
+            || { echo "::error::shared-initializer patch missing"; exit 1; }
+          nm -C "$a_path" | grep -q 'FusedConv' \
+            || { echo "::error::CPU fused kernels missing (cpu_ee compat)"; exit 1; }
+          echo "CUDA archive symbols verified"
+
+      - name: Upload CUDA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-cuda-linux-x86_64
+          path: |
+            ${{ env.ORT_PKG }}/dist/*cuda*.zip
+            ${{ env.ORT_PKG }}/dist/*cuda*.sha256
           if-no-files-found: error
           retention-days: 7
 
