@@ -32,7 +32,7 @@ diff --git a/onnxruntime/core/session/onnxruntime_c_api.cc b/onnxruntime/core/se
 index 4a1d2ca..ca8b73e 100644
 --- a/onnxruntime/core/session/onnxruntime_c_api.cc
 +++ b/onnxruntime/core/session/onnxruntime_c_api.cc
-@@ -1915,6 +1915,205 @@ ORT_API_STATUS_IMPL(OrtApis::SessionGetOverridableInitializerName, _In_ const Or
+@@ -1915,6 +1915,209 @@ ORT_API_STATUS_IMPL(OrtApis::SessionGetOverridableInitializerName, _In_ const Or
    API_IMPL_END
  }
  
@@ -194,7 +194,11 @@ index 4a1d2ca..ca8b73e 100644
 +    return OrtApis::CreateStatus(ORT_FAIL, "CUDA allocator returned null");
 +  ::onnxruntime::TensorShape shape = src_tensor.Shape();
 +  const auto* elem_type = src_tensor.DataType();
-+  ::onnxruntime::Tensor dst_tensor(elem_type, shape, dst_buf, allocator);
++
++  // Non-owning Tensor (OrtMemoryInfo, no deleter): destruction must NOT free
++  // dst_buf, which backs the returned user-owned OrtValue shared by sessions.
++  OrtMemoryInfo dst_mi("Cuda", OrtDeviceAllocator, dst_device, OrtMemTypeDefault);
++  ::onnxruntime::Tensor dst_tensor(elem_type, shape, dst_buf, dst_mi);
 +  auto copy_status = state.GetDataTransferMgr().CopyTensor(src_tensor, dst_tensor);
 +  if (!copy_status.IsOK()) {
 +    allocator->Free(dst_buf);
