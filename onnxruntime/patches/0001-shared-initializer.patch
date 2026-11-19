@@ -2,7 +2,7 @@ diff --git a/include/onnxruntime/core/session/onnxruntime_c_api.h b/include/onnx
 index 311f3cd..c0a4136 100644
 --- a/include/onnxruntime/core/session/onnxruntime_c_api.h
 +++ b/include/onnxruntime/core/session/onnxruntime_c_api.h
-@@ -7547,6 +7547,17 @@ struct OrtApi {
+@@ -7547,6 +7547,25 @@ struct OrtApi {
     */
    ORT_API2_STATUS(SessionOptionsSetWeightlessSourceModelBuffer, _Inout_ OrtSessionOptions* options,
                    _In_ const void* source_model_data, _In_ size_t source_model_data_length);
@@ -17,6 +17,14 @@ index 311f3cd..c0a4136 100644
 +
 +  ORT_API2_STATUS(SessionGetInitializer, _In_ const OrtSession* session, _In_z_ const char* name,
 +                  _Outptr_ OrtValue** out);
++
++  // Copy an initializer onto a CUDA device as a USER-OWNED OrtValue (OwnsBuffer()==false)
++  // so it can be injected via AddInitializer and shared zero-copy across sessions.
++  // Buffer is allocated with the session device allocator; caller frees the buffer
++  // (via cudaFree) after all sessions referencing the value are destroyed.
++  ORT_API2_STATUS(SessionGetInitializerOnDevice, _In_ const OrtSession* session,
++                  _In_z_ const char* name, _In_ int device_id,
++                  _Outptr_ OrtValue** out);
  };
  
  /*
@@ -24,7 +32,7 @@ diff --git a/onnxruntime/core/session/onnxruntime_c_api.cc b/onnxruntime/core/se
 index 4a1d2ca..ca8b73e 100644
 --- a/onnxruntime/core/session/onnxruntime_c_api.cc
 +++ b/onnxruntime/core/session/onnxruntime_c_api.cc
-@@ -1915,6 +1915,133 @@ ORT_API_STATUS_IMPL(OrtApis::SessionGetOverridableInitializerName, _In_ const Or
+@@ -1915,6 +1915,205 @@ ORT_API_STATUS_IMPL(OrtApis::SessionGetOverridableInitializerName, _In_ const Or
    API_IMPL_END
  }
  
@@ -155,10 +163,82 @@ index 4a1d2ca..ca8b73e 100644
 +  API_IMPL_END
 +}
 +
++ORT_API_STATUS_IMPL(OrtApis::SessionGetInitializerOnDevice, _In_ const OrtSession* sess,
++                    _In_z_ const char* name, _In_ int device_id,
++                    _Outptr_ OrtValue** out) {
++  API_IMPL_BEGIN
++  auto session = reinterpret_cast<const ::onnxruntime::InferenceSession*>(sess);
++  const auto& state = session->GetSessionState();
++  int idx = 0;
++  if (!state.GetOrtValueNameIdxMap().GetIdx(name, idx).IsOK())
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer not found");
++  const auto& tensors = state.GetInitializedTensors();
++  auto it = tensors.find(idx);
++  if (it == tensors.end())
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer not found");
++  const OrtValue* src = &it->second;
++  if (!src->IsTensor())
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer is not a tensor");
++  const auto& src_tensor = src->Get<::onnxruntime::Tensor>();
++  const auto& src_device = src_tensor.Location().device;
++  if (src_device.Type() != OrtDevice::GPU)
++    return OrtApis::CreateStatus(ORT_FAIL, "initializer is not on CUDA device");
++  OrtDevice dst_device(OrtDevice::GPU, OrtDevice::MemType::DEFAULT,
++                       OrtDevice::VendorIds::NVIDIA, device_id);
++  auto allocator = state.GetAllocator(dst_device);
++  if (!allocator)
++    return OrtApis::CreateStatus(ORT_FAIL, "no CUDA allocator for device");
++  const size_t nbytes = src_tensor.SizeInBytes();
++  void* dst_buf = allocator->Alloc(nbytes);
++  if (!dst_buf)
++    return OrtApis::CreateStatus(ORT_FAIL, "CUDA allocator returned null");
++  ::onnxruntime::TensorShape shape = src_tensor.Shape();
++  const auto* elem_type = src_tensor.DataType();
++  ::onnxruntime::Tensor dst_tensor(elem_type, shape, dst_buf, allocator);
++  auto copy_status = state.GetDataTransferMgr().CopyTensor(src_tensor, dst_tensor);
++  if (!copy_status.IsOK()) {
++    allocator->Free(dst_buf);
++    return OrtApis::CreateStatus(ORT_FAIL, copy_status.ErrorMessage().c_str());
++  }
++  std::vector<int64_t> dims(shape.NumDimensions());
++  for (size_t i = 0; i < shape.NumDimensions(); ++i) dims[i] = shape[i];
++  ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
++  if (elem_type == DataTypeImpl::GetType<float>())
++    et = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
++  else if (elem_type == DataTypeImpl::GetType<double>())
++    et = ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE;
++  else if (elem_type == DataTypeImpl::GetType<int64_t>())
++    et = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
++  else if (elem_type == DataTypeImpl::GetType<int32_t>())
++    et = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
++  else if (elem_type == DataTypeImpl::GetType<MLFloat16>())
++    et = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
++  else {
++    allocator->Free(dst_buf);
++    return OrtApis::CreateStatus(ORT_FAIL, "unsupported element type for device initializer");
++  }
++  OrtMemoryInfo* mi = nullptr;
++  if (OrtStatus* st = OrtApis::CreateMemoryInfo("Cuda", OrtDeviceAllocator, device_id,
++                                                OrtMemTypeDefault, &mi)) {
++    allocator->Free(dst_buf);
++    return st;
++  }
++  OrtValue* dst_ov = nullptr;
++  if (OrtStatus* st = OrtApis::CreateTensorWithDataAsOrtValue(mi, dst_buf, nbytes,
++                                                              dims.data(), dims.size(), et, &dst_ov)) {
++    OrtApis::ReleaseMemoryInfo(mi);
++    allocator->Free(dst_buf);
++    return st;
++  }
++  OrtApis::ReleaseMemoryInfo(mi);
++  *out = dst_ov;
++  return nullptr;
++  API_IMPL_END
++}
  ORT_API_STATUS_IMPL(OrtApis::AllocatorAlloc, _Inout_ OrtAllocator* ptr, size_t size, _Outptr_ void** out) {
    API_IMPL_BEGIN
    *out = ptr->Alloc(ptr, size);
-@@ -4939,6 +5066,10 @@ static constexpr OrtApi ort_api_1_to_29 = {
+@@ -4939,6 +5066,12 @@ static constexpr OrtApi ort_api_1_to_29 = {
      // End of Version 28 - DO NOT MODIFY ABOVE (see above text for more information)
  
      &OrtApis::SessionOptionsSetWeightlessSourceModelBuffer,
@@ -166,6 +246,8 @@ index 4a1d2ca..ca8b73e 100644
 +    &OrtApis::SessionGetInitializerCount,
 +    &OrtApis::SessionGetInitializerName,
 +    &OrtApis::SessionGetInitializer,
++    // --- new: device-resident shared initializer (zero-copy across sessions) ---
++    &OrtApis::SessionGetInitializerOnDevice,
  };
  
  // OrtApiBase can never change as there is no way to know what version of OrtApiBase is returned by OrtGetApiBase.
@@ -173,7 +255,7 @@ diff --git a/onnxruntime/core/session/ort_apis.h b/onnxruntime/core/session/ort_
 index 550c7d5..3c19d93 100644
 --- a/onnxruntime/core/session/ort_apis.h
 +++ b/onnxruntime/core/session/ort_apis.h
-@@ -91,6 +91,16 @@ ORT_API_STATUS_IMPL(SessionGetInputName, _In_ const OrtSession* sess, size_t ind
+@@ -91,6 +91,19 @@ ORT_API_STATUS_IMPL(SessionGetInputName, _In_ const OrtSession* sess, size_t ind
  ORT_API_STATUS_IMPL(SessionGetOutputName, _In_ const OrtSession* sess, size_t index, _Inout_ OrtAllocator* allocator, _Outptr_ char** value);
  ORT_API_STATUS_IMPL(SessionGetOverridableInitializerName, _In_ const OrtSession* sess, size_t index,
                      _Inout_ OrtAllocator* allocator, _Outptr_ char** value);
@@ -185,6 +267,9 @@ index 550c7d5..3c19d93 100644
 +ORT_API_STATUS_IMPL(SessionGetInitializerName, _In_ const OrtSession* session, size_t index,
 +                    _Inout_ OrtAllocator* allocator, _Outptr_ char** output);
 +ORT_API_STATUS_IMPL(SessionGetInitializer, _In_ const OrtSession* session, _In_z_ const char* name,
++                    _Outptr_ OrtValue** out);
++ORT_API_STATUS_IMPL(SessionGetInitializerOnDevice, _In_ const OrtSession* session,
++                    _In_z_ const char* name, _In_ int device_id,
 +                    _Outptr_ OrtValue** out);
 +
  ORT_API_STATUS_IMPL(SessionEndProfiling, _In_ OrtSession* sess, _Inout_ OrtAllocator* allocator,
