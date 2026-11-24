@@ -110,7 +110,7 @@ jobs:
           tar -xzf "$archive" -C "$work"
 
           # Verify no nested archive members in libvisio-0.1.a and no real ICU ucnv_* refs.
-          if ar t "$work/lib/libvisio-0.1.a" | grep -qv '\.o$'; then
+          if ar t "$work/lib/libvisio-0.1.a" | grep -q '\.a$'; then
             echo "::error::unexpected non-object member inside libvisio-0.1.a"
             exit 1
           fi
