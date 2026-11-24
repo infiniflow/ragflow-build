@@ -88,10 +88,15 @@ jobs:
             | (if ($want | length) == 0 then . else map(select(.target as $t | $want | index($t))) end)
             | {include: .}')"
           if [ -n "$INPUT_TARGETS" ]; then
-            want_n="$(printf '%s' "$INPUT_TARGETS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
-            got_n="$(printf '%s' "$matrix" | jq '.include | length')"
-            if [ "$want_n" != "$got_n" ]; then
-              echo "::error::unknown target in '$INPUT_TARGETS'; known targets: $(printf '%s' "$TARGET_MATRIX" | jq -r '.[].target' | tr '\n' ' ')"
+            # wc -l counts newlines and `printf '%s'` writes no trailing one, so
+            # counting this way always reported 0 targets and rejected every
+            # filtered build. Ask jq which names are unknown instead.
+            unknown="$(printf '%s' "$TARGET_MATRIX" | jq -r --arg targets "$INPUT_TARGETS" '
+              ($targets | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $want
+              | [.[].target] as $known
+              | $want | map(select(. as $w | $known | index($w) | not)) | join(", ")')"
+            if [ -n "$unknown" ]; then
+              echo "::error::unknown target(s): $unknown; known targets: $(printf '%s' "$TARGET_MATRIX" | jq -r '.[].target' | tr '\n' ' ')"
               exit 1
             fi
           fi
