@@ -1,0 +1,237 @@
+name: libvisio release
+
+on:
+  pull_request:
+    paths:
+      - 'libvisio/**'
+      - '.github/workflows/libvisio-release.yml'
+  push:
+    tags:
+      - 'libvisio-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'libvisio version to build (default: libvisio/LIBVISIO_VERSION)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Build only, do not publish a GitHub release'
+        type: boolean
+        default: false
+      draft:
+        description: 'Publish the release as a draft'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  PKG_DIR: libvisio
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Resolve libvisio version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version=""
+          case "$REF_NAME" in
+            libvisio-v*) version="${REF_NAME#libvisio-}" ;;
+          esac
+          [ -n "$version" ] || version="$INPUT_VERSION"
+          [ -n "$version" ] || version="$(tr -d '[:space:]' < "${{ env.PKG_DIR }}/LIBVISIO_VERSION")"
+          case "$version" in
+            v*) : ;;
+            *) echo "::error::version '$version' must start with 'v' (e.g. v0.1.10)"; exit 1 ;;
+          esac
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "libvisio version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME)"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            # ubuntu-22.04 pins glibc 2.35 / GCC 11.4 so the published .a links
+            # cleanly on Ubuntu 22.04+ consumers without __isoc23_* / _M_replace_cold.
+            os: ubuntu-22.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: darwin-arm64
+            os: macos-latest
+          - target: darwin-amd64
+            os: macos-15-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libboost-dev pkg-config zlib1g-dev
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install boost pkg-config
+
+      - name: Build ${{ matrix.target }}
+        shell: bash
+        run: |
+          bash "${{ env.PKG_DIR }}/build.sh" \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.prepare.outputs.version }}"
+
+      - name: Smoke test (link and execute probe)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(ls "${{ env.PKG_DIR }}"/dist/*.tar.gz | head -1)"
+          [ -n "$archive" ] || { echo "::error::no archive found"; exit 1; }
+          work="$(mktemp -d)"
+          tar -xzf "$archive" -C "$work"
+
+          # Verify no nested archive members in libvisio-0.1.a and no real ICU ucnv_* refs.
+          if ar t "$work/lib/libvisio-0.1.a" | grep -q '\.a$'; then
+            echo "::error::unexpected non-object member inside libvisio-0.1.a"
+            exit 1
+          fi
+          if nm -u "$work/lib/libvisio-0.1.a" | grep -E 'ucnv_' | grep -vq 'visio_ucnv_'; then
+            echo "::error::unexpected unshimmed ICU ucnv_* reference in libvisio-0.1.a"
+            exit 1
+          fi
+
+          cat > "$work/probe.cc" << 'EOF'
+          #include <cstdint>
+          #include <librevenge-generators/librevenge-generators.h>
+          #include <librevenge-stream/librevenge-stream.h>
+          #include <libvisio/libvisio.h>
+          extern "C" {
+          struct VisioUConverter;
+          VisioUConverter *visio_ucnv_open(const char *, int32_t *err) { if (err) *err = 1; return nullptr; }
+          int32_t visio_ucnv_getNextUChar(VisioUConverter *, const char **, const char *, int32_t *err) { if (err) *err = 1; return -1; }
+          void visio_ucnv_close(VisioUConverter *) {}
+          }
+          int main() {
+              const unsigned char dummy[] = {'n','o','t','v','i','s','i','o'};
+              librevenge::RVNGStringStream input(dummy, sizeof(dummy));
+              librevenge::RVNGStringVector svgs;
+              librevenge::RVNGSVGDrawingGenerator gen(svgs, "");
+              return libvisio::VisioDocument::parse(&input, &gen) ? 1 : 0;
+          }
+          EOF
+
+          c++ -std=c++17 -o "$work/probe" "$work/probe.cc" \
+            -I"$work/include/libvisio-0.1" -I"$work/include/librevenge-0.0" \
+            "$work/lib/libvisio-0.1.a" \
+            "$work/lib/librevenge-generators-0.0.a" \
+            "$work/lib/librevenge-stream-0.0.a" \
+            "$work/lib/librevenge-0.0.a" \
+            "$work/lib/libxml2.a" \
+            -lz
+          "$work/probe"
+          echo "OK: probe linked and ran cleanly on ${{ matrix.target }}"
+
+      - name: Portability gate (nm) — linux-amd64
+        if: matrix.target == 'linux-amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(ls "${{ env.PKG_DIR }}"/dist/*.tar.gz | head -1)"
+          work="$(mktemp -d)"
+          tar -xzf "$archive" -C "$work"
+          for a in "$work"/lib/*.a; do
+            if nm "$a" 2>/dev/null | grep -E '__isoc23_|_M_replace_cold'; then
+              echo "::error::non-portable symbols in $a (must build on ubuntu-22.04)"
+              exit 1
+            fi
+          done
+          echo "OK: no __isoc23_* / _M_replace_cold symbols"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvisio-${{ matrix.target }}
+          path: |
+            ${{ env.PKG_DIR }}/dist/*.tar.gz
+            ${{ env.PKG_DIR }}/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: [prepare, build]
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || !inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+
+          {
+            echo "Static **libvisio ${version}** (+ librevenge 0.0.5 + libxml2 2.12.9) built from unmodified upstream sources."
+            echo
+            echo "ICU converter calls (\`ucnv_open\` / \`ucnv_getNextUChar\` / \`ucnv_close\`) are remapped at compile time to \`visio_ucnv_*\` to avoid ICU symbol collisions with \`libpdfium.a\`."
+            echo
+            echo "## Downloads"
+            echo
+            echo "| Artifact | Target | Size | SHA-256 |"
+            echo "| --- | --- | --- | --- |"
+          } > notes.md
+
+          found=0
+          for archive in dist/*.tar.gz; do
+            [ -e "$archive" ] || continue
+            found=$((found + 1))
+            name="$(basename "$archive")"
+            target="${name#libvisio-${version}-}"
+            target="${target%.tar.gz}"
+            size="$(du -h "$archive" | cut -f1)"
+            sha="n/a"
+            [ -f "${archive}.sha256" ] && sha="$(cut -d' ' -f1 "${archive}.sha256")"
+            echo "| \`${name}\` | \`${target}\` | ${size} | \`${sha}\` |" >> notes.md
+          done
+
+          [ "$found" -gt 0 ] || { echo "::error::no archives found"; exit 1; }
+          cat dist/*.sha256 > dist/checksums.txt
+          cat notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('libvisio-{0}', needs.prepare.outputs.version) || github.ref_name }}
+          name: libvisio ${{ needs.prepare.outputs.version }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: false
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/checksums.txt
