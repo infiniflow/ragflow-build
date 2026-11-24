@@ -162,7 +162,15 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             export PATH="/c/msys64/mingw64/bin:$PATH"
           fi
-          archive="$(ls "${{ env.PKG_DIR }}"/dist/*.tar.gz "${{ env.PKG_DIR }}"/dist/*.zip 2>/dev/null | head -1)"
+          # One glob per platform: `ls a/*.tar.gz b/*.zip` fails with status 2
+          # whenever the second pattern matches nothing, and -o pipefail turns
+          # that into a silent exit.
+          archive=""
+          for candidate in "${{ env.PKG_DIR }}"/dist/*.tar.gz "${{ env.PKG_DIR }}"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            archive="$candidate"
+            break
+          done
           [ -n "$archive" ] || { echo "::error::no archive found"; exit 1; }
           work="$(mktemp -d)"
           case "$archive" in

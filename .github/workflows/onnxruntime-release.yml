@@ -5,6 +5,10 @@ name: onnxruntime release
 # here while everything it executes lives under onnxruntime/.
 
 on:
+  pull_request:
+    paths:
+      - 'onnxruntime/**'
+      - '.github/workflows/onnxruntime-release.yml'
   push:
     tags:
       # The tag carries the version: pushing release-v1.30.0 builds and
@@ -47,6 +51,11 @@ env:
   # windows-arm64 exists in build.sh/package.sh but stays out of the matrix: it
   # needs the same x64 runner plus the arm64 MSVC cross tools, and nothing
   # consumes it yet.
+  #
+  # A pull request builds only PR_TARGETS: reviewing a change should not spend
+  # hours rebuilding every published platform (the full matrix still runs on a
+  # tag push and on an unfiltered workflow_dispatch).
+  PR_TARGETS: windows-x64
   TARGET_MATRIX: |
     [
       {"target": "linux-x86_64", "variant": "minimal", "os": "ubuntu-22.04"},
@@ -110,6 +119,14 @@ jobs:
           # version. That is also what makes a partial rebuild land on the
           # release that is already published instead of creating a new one.
           [ -n "$tag" ] || tag="onnxruntime-${version}"
+
+          # A pull request builds only PR_TARGETS unless it was targeted
+          # explicitly, so reviewing a dependency change does not rebuild the
+          # whole published matrix.
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -z "$INPUT_TARGETS" ]; then
+            INPUT_TARGETS="$PR_TARGETS"
+            echo "pull request: building $INPUT_TARGETS only"
+          fi
 
           # A job-level if cannot see the matrix, so the restriction happens
           # here and the build job consumes the already filtered matrix.
@@ -215,7 +232,12 @@ jobs:
         run: |
           set -euo pipefail
           pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          zip_path=""
+          for candidate in "$pkg"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            zip_path="$candidate"
+            break
+          done
           [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
 
           work="$(mktemp -d)"
@@ -317,7 +339,12 @@ jobs:
         run: |
           set -euo pipefail
           pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          zip_path=""
+          for candidate in "$pkg"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            zip_path="$candidate"
+            break
+          done
           [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
           work="$(mktemp -d)"
           unzip -q "$zip_path" -d "$work"
@@ -350,7 +377,12 @@ jobs:
         run: |
           set -euo pipefail
           pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          zip_path=""
+          for candidate in "$pkg"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            zip_path="$candidate"
+            break
+          done
           [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
           work="$(mktemp -d)"
           unzip -q "$zip_path" -d "$work"
@@ -378,7 +410,7 @@ jobs:
   release:
     name: release
     needs: [prepare, build]
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || !inputs.dry_run) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
