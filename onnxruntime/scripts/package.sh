@@ -278,6 +278,19 @@ find_msvc_lib() {
     return 1
 }
 
+# MSVC tools are native Windows binaries: neither the /c/... form of a path nor
+# the MSYS2 /tmp mount means anything to them, and MSYS2 does not translate
+# path-like arguments that sit inside a response file. cygpath -m yields C:/...
+# which both bash and lib.exe accept, so every path crosses the boundary through
+# this helper.
+to_win() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 merge_libs() {
     local out="$1"; shift
     local mri rsp
@@ -287,7 +300,7 @@ merge_libs() {
             libtool -static -o "$out" "$@"
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            local lib_exe
+            local lib_exe lib_path
             if ! lib_exe="$(find_msvc_lib)"; then
                 echo "error: MSVC 'lib.exe' not found." >&2
                 echo "       Run this from a Visual Studio developer prompt or" >&2
@@ -295,9 +308,12 @@ merge_libs() {
                 return 1
             fi
             echo "    using $(printf '%s' "$lib_exe")"
-            rsp="$(mktemp)"
-            printf '"%s"\n' "$@" > "$rsp"
-            "$lib_exe" /NOLOGO "/OUT:$out" "@$rsp"
+            rsp="$(to_win "$(mktemp)")"
+            : > "$rsp"
+            for lib_path in "$@"; do
+                printf '"%s"\n' "$(to_win "$lib_path")" >> "$rsp"
+            done
+            "$lib_exe" /NOLOGO "/OUT:$(to_win "$out")" "@$rsp"
             rm -f "$rsp"
             ;;
         *)
@@ -362,7 +378,15 @@ merge_libs "$STAGE_DIR/lib/$LIB_NAME" "${ORDERED[@]}"
     echo
 
     echo "usage         :"
-    echo "  g++ app.cc -I<pkg>/include <pkg>/lib/${LIB_NAME} -lpthread -ldl -lm -o app"
+    case "$TARGET" in
+        windows-*)
+            echo "  cl app.cc /I <pkg>/include <pkg>/lib/${LIB_NAME} advapi32.lib"
+            echo "  (MSVC; the archive references the MSVC runtime it was built against)"
+            ;;
+        *)
+            echo "  g++ app.cc -I<pkg>/include <pkg>/lib/${LIB_NAME} -lpthread -ldl -lm -o app"
+            ;;
+    esac
 } > "$STAGE_DIR/BUILD_INFO.txt"
 
 # --- archive -----------------------------------------------------------------

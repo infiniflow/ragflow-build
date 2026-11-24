@@ -14,6 +14,10 @@ on:
         description: 'libvisio version to build (default: libvisio/LIBVISIO_VERSION)'
         required: false
         default: ''
+      targets:
+        description: 'Comma-separated targets to build (default: all). A partial list APPENDS its archives to the existing release instead of replacing it, e.g. "windows-amd64".'
+        required: false
+        default: ''
       dry_run:
         description: 'Build only, do not publish a GitHub release'
         type: boolean
@@ -28,6 +32,20 @@ permissions:
 
 env:
   PKG_DIR: libvisio
+  # target -> runner, the single source of truth for the build matrix. The
+  # `targets` input of a manual run narrows it (comma separated), so a single
+  # platform can be rebuilt and appended to the already published release
+  # without touching the archives that are already there.
+  #   linux-amd64  : ubuntu-22.04 pins glibc 2.35 / GCC 11.4 for the consumers.
+  #   windows-amd64: MSYS2 MINGW64 (msvcrt) autotools build, ships MinGW .a.
+  TARGET_MATRIX: |
+    [
+      {"target": "linux-amd64", "os": "ubuntu-22.04"},
+      {"target": "linux-arm64", "os": "ubuntu-24.04-arm"},
+      {"target": "darwin-arm64", "os": "macos-latest"},
+      {"target": "darwin-amd64", "os": "macos-15-intel"},
+      {"target": "windows-amd64", "os": "windows-latest"}
+    ]
 
 jobs:
   prepare:
@@ -35,6 +53,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
+      tag: ${{ steps.version.outputs.tag }}
+      matrix: ${{ steps.version.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: version
@@ -42,11 +62,13 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_TARGETS: ${{ github.event.inputs.targets }}
         run: |
           set -euo pipefail
           version=""
+          tag=""
           case "$REF_NAME" in
-            libvisio-v*) version="${REF_NAME#libvisio-}" ;;
+            libvisio-v*) tag="$REF_NAME"; version="${REF_NAME#libvisio-}" ;;
           esac
           [ -n "$version" ] || version="$INPUT_VERSION"
           [ -n "$version" ] || version="$(tr -d '[:space:]' < "${{ env.PKG_DIR }}/LIBVISIO_VERSION")"
@@ -54,8 +76,33 @@ jobs:
             v*) : ;;
             *) echo "::error::version '$version' must start with 'v' (e.g. v0.1.10)"; exit 1 ;;
           esac
-          echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "libvisio version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME)"
+          # A manual run has no tag ref, so the release tag is derived from the
+          # version. That is also what makes a partial rebuild land on the
+          # release that is already published instead of creating a new one.
+          [ -n "$tag" ] || tag="libvisio-${version}"
+
+          # A job-level if cannot see the matrix, so the restriction happens
+          # here and the build job consumes the already filtered matrix.
+          matrix="$(printf '%s' "$TARGET_MATRIX" | jq -c --arg targets "$INPUT_TARGETS" '
+            ($targets | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $want
+            | (if ($want | length) == 0 then . else map(select(.target as $t | $want | index($t))) end)
+            | {include: .}')"
+          if [ -n "$INPUT_TARGETS" ]; then
+            want_n="$(printf '%s' "$INPUT_TARGETS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+            got_n="$(printf '%s' "$matrix" | jq '.include | length')"
+            if [ "$want_n" != "$got_n" ]; then
+              echo "::error::unknown target in '$INPUT_TARGETS'; known targets: $(printf '%s' "$TARGET_MATRIX" | jq -r '.[].target' | tr '\n' ' ')"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "value=$version"
+            echo "tag=$tag"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "libvisio version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME, release tag: $tag)"
+          echo "build matrix: $matrix"
 
   build:
     name: build ${{ matrix.target }}
@@ -64,18 +111,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: linux-amd64
-            # ubuntu-22.04 pins glibc 2.35 / GCC 11.4 so the published .a links
-            # cleanly on Ubuntu 22.04+ consumers without __isoc23_* / _M_replace_cold.
-            os: ubuntu-22.04
-          - target: linux-arm64
-            os: ubuntu-24.04-arm
-          - target: darwin-arm64
-            os: macos-latest
-          - target: darwin-amd64
-            os: macos-15-intel
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -93,21 +129,49 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install boost pkg-config
 
+      - name: Install build deps (windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          # fixed location: the build/smoke steps enter it as /c/msys64/usr/bin/bash
+          location: C:\msys64
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-boost
+            pkgconf
+            zip
+            unzip
+
       - name: Build ${{ matrix.target }}
         shell: bash
         run: |
-          bash "${{ env.PKG_DIR }}/build.sh" \
-            --target "${{ matrix.target }}" \
-            --version "${{ needs.prepare.outputs.version }}"
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+            # autotools needs the whole MSYS2 userland (make, pkg-config, sh, ar),
+            # so the build runs inside the MINGW64 login shell; MSYSTEM there
+            # selects the msvcrt toolchain the Go sidecar links against.
+            MSYSTEM=MINGW64 CHERE_INVOKING=1 /c/msys64/usr/bin/bash -lc \
+              "bash '$PWD/${{ env.PKG_DIR }}/build.sh' --target 'windows-amd64' --version '${{ needs.prepare.outputs.version }}'"
+          else
+            bash "${{ env.PKG_DIR }}/build.sh" \
+              --target "${{ matrix.target }}" \
+              --version "${{ needs.prepare.outputs.version }}"
+          fi
 
-      - name: Smoke test (link and execute probe)
+      - name: Write the smoke probe script
         shell: bash
         run: |
+          cat > "$RUNNER_TEMP/smoke.sh" << 'SMOKE'
           set -euo pipefail
-          archive="$(ls "${{ env.PKG_DIR }}"/dist/*.tar.gz | head -1)"
+          archive="$(ls "${{ env.PKG_DIR }}"/dist/*.tar.gz "${{ env.PKG_DIR }}"/dist/*.zip 2>/dev/null | head -1)"
           [ -n "$archive" ] || { echo "::error::no archive found"; exit 1; }
           work="$(mktemp -d)"
-          tar -xzf "$archive" -C "$work"
+          case "$archive" in
+            *.zip)  unzip -q "$archive" -d "$work" ;;
+            *)      tar -xzf "$archive" -C "$work" ;;
+          esac
 
           # Verify no nested archive members in libvisio-0.1.a and no real ICU ucnv_* refs.
           if ar t "$work/lib/libvisio-0.1.a" | grep -q '\.a$'; then
@@ -139,16 +203,42 @@ jobs:
           }
           EOF
 
-          c++ -std=c++17 -o "$work/probe" "$work/probe.cc" \
+          # libxml2 is configured --without-zlib / --without-iconv, so the probe
+          # links nothing beyond the archives themselves. Windows keeps the C++
+          # runtime static so the probe binary is self-contained.
+          libs=""
+          probe="$work/probe"
+          case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*)
+              libs="-static-libgcc -static-libstdc++"
+              probe="$work/probe.exe"
+              ;;
+            *)
+              libs="-lz"
+              ;;
+          esac
+
+          c++ -std=c++17 -o "$probe" "$work/probe.cc" \
             -I"$work/include/libvisio-0.1" -I"$work/include/librevenge-0.0" \
             "$work/lib/libvisio-0.1.a" \
             "$work/lib/librevenge-generators-0.0.a" \
             "$work/lib/librevenge-stream-0.0.a" \
             "$work/lib/librevenge-0.0.a" \
             "$work/lib/libxml2.a" \
-            -lz
-          "$work/probe"
+            $libs
+          "$probe"
           echo "OK: probe linked and ran cleanly on ${{ matrix.target }}"
+          SMOKE
+
+      - name: Smoke test (windows, MSYS2)
+        if: matrix.target == 'windows-amd64'
+        shell: msys2 {0}
+        run: bash "$(cygpath -u "$RUNNER_TEMP")/smoke.sh"
+
+      - name: Smoke test (posix)
+        if: matrix.target != 'windows-amd64'
+        shell: bash
+        run: bash "$RUNNER_TEMP/smoke.sh"
 
       - name: Portability gate (nm) — linux-amd64
         if: matrix.target == 'linux-amd64'
@@ -172,6 +262,7 @@ jobs:
           name: libvisio-${{ matrix.target }}
           path: |
             ${{ env.PKG_DIR }}/dist/*.tar.gz
+            ${{ env.PKG_DIR }}/dist/*.zip
             ${{ env.PKG_DIR }}/dist/*.sha256
           if-no-files-found: error
           retention-days: 7
@@ -190,6 +281,29 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A partial build (targets input) must not replace a published release:
+      # keep the archives that are already there and only add the ones built
+      # now. The existing checksums.txt is the source of truth for what is
+      # already published, so it is fetched and merged rather than rewritten.
+      - name: Fetch the published release state
+        id: existing
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.targets != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p existing
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'checksums.txt' --dir existing || true
+            echo "append=true" >> "$GITHUB_OUTPUT"
+            echo "appending to the existing release $TAG"
+          else
+            echo "append=false" >> "$GITHUB_OUTPUT"
+            echo "no release for $TAG yet; publishing a new one"
+          fi
+
       - name: Build release notes
         run: |
           set -euo pipefail
@@ -207,12 +321,13 @@ jobs:
           } > notes.md
 
           found=0
-          for archive in dist/*.tar.gz; do
+          for archive in dist/*.tar.gz dist/*.zip; do
             [ -e "$archive" ] || continue
             found=$((found + 1))
             name="$(basename "$archive")"
             target="${name#libvisio-${version}-}"
             target="${target%.tar.gz}"
+            target="${target%.zip}"
             size="$(du -h "$archive" | cut -f1)"
             sha="n/a"
             [ -f "${archive}.sha256" ] && sha="$(cut -d' ' -f1 "${archive}.sha256")"
@@ -220,18 +335,32 @@ jobs:
           done
 
           [ "$found" -gt 0 ] || { echo "::error::no archives found"; exit 1; }
+
           cat dist/*.sha256 > dist/checksums.txt
-          cat notes.md
+          if [ -f existing/checksums.txt ]; then
+            # Union of what is already published and what this run built; a name
+            # in both keeps this run's line so a re-run corrects a stale digest
+            # instead of duplicating the entry.
+            awk 'FNR==NR { if (NF) seen[$NF]=1; print; next }
+                 { if (NF && !($NF in seen)) print }' \
+              dist/checksums.txt existing/checksums.txt > dist/checksums.merged
+            mv dist/checksums.merged dist/checksums.txt
+          fi
+          cat notes.md dist/checksums.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('libvisio-{0}', needs.prepare.outputs.version) || github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
           name: libvisio ${{ needs.prepare.outputs.version }}
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          # Never demote an already published release back to a draft when a
+          # partial build appends to it.
+          draft: ${{ steps.existing.outputs.append != 'true' && github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          append_body: ${{ steps.existing.outputs.append == 'true' }}
           prerelease: false
           body_path: notes.md
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
             dist/checksums.txt

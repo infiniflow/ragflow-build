@@ -13,9 +13,18 @@
 # 3 ICU converter functions (ucnv_open / ucnv_getNextUChar / ucnv_close) to
 # visio_ucnv_* symbols supplied by the consumer (e.g. via POSIX iconv).
 #
-# Bash 3.2 compatible (macOS default bash).
+# Windows (windows-amd64) builds the same upstream sources with the MSYS2
+# MINGW64 toolchain and ships MinGW-w64 .a archives, because that is what the Go
+# sidecar's cgo link uses. Upstream only has autotools, so MSVC is not an option
+# here; the archives carry the msvcrt-based MinGW64 runtime, matching Go's cgo
+# toolchain. Run it from an MSYS2 MINGW64 shell (pacman -S
+# mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip).
+#
+# Bash 3.2 compatible (macOS default bash) and Windows/Git Bash compatible.
 # -----------------------------------------------------------------------------
 set -euo pipefail
+
+die() { echo "error: $*" >&2; exit 1; }
 
 PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="${PKG_DIR}/LIBVISIO_VERSION"
@@ -41,7 +50,8 @@ usage() {
 Usage: libvisio/build.sh [options]
 
 Options:
-  --target <name>     Target triple: linux-amd64, linux-arm64, darwin-amd64, darwin-arm64
+  --target <name>     Target triple: linux-amd64, linux-arm64, darwin-amd64,
+                      darwin-arm64, windows-amd64
   --version <ver>     libvisio version tag (default: libvisio/LIBVISIO_VERSION, e.g. v0.1.10)
   --dist-dir <path>   Output directory for release archive (default: libvisio/dist)
   --jobs <n>, -j <n>  Parallel make jobs
@@ -67,7 +77,12 @@ esac
 
 detect_host_target() {
     local os arch
-    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+        Darwin)               os="darwin" ;;
+        Linux)                os="linux" ;;
+        *)                    os="$(uname -s | tr '[:upper:]' '[:lower:]')" ;;
+    esac
     arch="$(uname -m)"
     case "$arch" in
         x86_64|amd64) arch="amd64" ;;
@@ -79,11 +94,26 @@ detect_host_target() {
 
 [ -n "$TARGET" ] || TARGET="$(detect_host_target)"
 
+# PIC_FLAG is empty on Windows: MinGW-w64 has no PIC distinction, and -fPIC is
+# meaningless there. Every other knob below stays identical per target so the
+# archives already published for linux/darwin are rebuilt from the same recipe.
+PIC_FLAG="-fPIC"
+ARCHIVE_EXT="tar.gz"
 case "$TARGET" in
     linux-amd64)  TARGET_OS="linux";  TARGET_ARCH="amd64" ;;
     linux-arm64)  TARGET_OS="linux";  TARGET_ARCH="arm64" ;;
     darwin-amd64) TARGET_OS="darwin"; TARGET_ARCH="amd64" ;;
     darwin-arm64) TARGET_OS="darwin"; TARGET_ARCH="arm64" ;;
+    windows-amd64)
+        TARGET_OS="windows"; TARGET_ARCH="amd64"
+        PIC_FLAG=""
+        ARCHIVE_EXT="zip"
+        ;;
+    windows-arm64)
+        die "windows-arm64 is not supported: MSYS2 has no aarch64-w64-mingw32 gcc for
+       an autotools build, and the Go sidecar's cgo link needs that toolchain.
+       Build windows-amd64 instead."
+        ;;
     *) echo "error: unsupported target: $TARGET" >&2; exit 1 ;;
 esac
 
@@ -122,6 +152,74 @@ strip_llvm_linker_options() {
     fi
     "$objcopy_bin" --remove-section=.linker-options "$archive"
 }
+
+# Windows archives land as a .zip (PowerShell's Expand-Archive handles nothing
+# else); every POSIX target keeps the .tar.gz it has always shipped.
+pack_archive() {
+    local stage="$1" out="$2" ext="$3"
+    rm -f "$out"
+    case "$ext" in
+        zip)
+            if command -v zip >/dev/null 2>&1; then
+                ( cd "$stage" && zip -q -r -y "$out" . )
+                return 0
+            fi
+            if command -v powershell >/dev/null 2>&1; then
+                local win_stage win_out
+                win_stage="$(cygpath -w "$stage")"
+                win_out="$(cygpath -w "$out")"
+                powershell -NoProfile -NonInteractive -Command \
+                    "Compress-Archive -Path '${win_stage}\\*' -DestinationPath '${win_out}' -Force"
+                return 0
+            fi
+            die "creating ${out##*/} needs 'zip' (MSYS2: pacman -S zip) or PowerShell"
+            ;;
+        *)
+            tar -czf "$out" -C "$stage" .
+            ;;
+    esac
+}
+
+# Everything the Windows build needs has to be present before the first
+# configure runs: autotools drives the build, boost is header-only for libvisio,
+# and the compiler must be the MinGW-w64 one so the .a archives carry the same
+# runtime (msvcrt) as Go's cgo link.
+preflight_windows() {
+    [ "$TARGET_OS" = "windows" ] || return 0
+
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *) die "windows-amd64 must be built on Windows from an MSYS2 MINGW64 shell" ;;
+    esac
+
+    local tool
+    for tool in gcc g++ make pkg-config; do
+        command -v "$tool" >/dev/null 2>&1 \
+            || die "missing $tool: run this from the MSYS2 MINGW64 shell with
+       'pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip'"
+    done
+
+    case "$(gcc -dumpmachine 2>/dev/null || true)" in
+        *mingw*) ;;
+        *) die "gcc is not a MinGW-w64 compiler ($(gcc -dumpmachine 2>/dev/null)); the
+       Go sidecar links the msvcrt-based MinGW64 runtime, so a Cygwin or MSVC
+       compiler cannot produce compatible archives" ;;
+    esac
+
+    # libvisio needs boost headers only; the MSYS2 MINGW64 prefix is already on
+    # the default include path, so this is a presence check, not a flag.
+    printf '#include <boost/shared_ptr.hpp>\n' | g++ -E -x c++ - >/dev/null 2>&1 \
+        || die "boost headers not found (MSYS2: pacman -S mingw-w64-x86_64-boost)"
+
+    case "${MSYSTEM:-}" in
+        UCRT64|CLANG64|CLANGARM64)
+            echo "warning: MSYSTEM=$MSYSTEM targets the UCRT, but the Go sidecar links the" >&2
+            echo "         msvcrt-based MinGW64 runtime; run this from MINGW64 instead." >&2
+            ;;
+    esac
+}
+
+preflight_windows
 
 VISIO_URL="https://dev-www.libreoffice.org/src/libvisio/libvisio-${BARE_VERSION}.tar.xz"
 VISIO_SHA256=""
@@ -172,7 +270,7 @@ echo "==> Building static libxml2 ${LIBXML2_VERSION} (unmodified)"
         --without-http --without-ftp --without-catalog \
         --without-modules --without-debug --without-zlib \
         --without-readline --without-history --without-iconv \
-        CFLAGS="-O2 -fPIC"
+        CFLAGS="-O2 ${PIC_FLAG}"
     make -j"$JOBS"
     make install
 )
@@ -184,8 +282,8 @@ echo "==> Building static librevenge ${REVENGE_VERSION} (unmodified)"
         --prefix="$PREFIX" \
         --enable-static --disable-shared \
         --disable-tests --without-docs --disable-werror \
-        CFLAGS="-O2 -fPIC" \
-        CXXFLAGS="-O2 -fPIC -std=c++17 ${EXTRA_INC}" \
+        CFLAGS="-O2 ${PIC_FLAG}" \
+        CXXFLAGS="-O2 ${PIC_FLAG} -std=c++17 ${EXTRA_INC}" \
         CPPFLAGS="${EXTRA_INC}"
     make -j"$JOBS"
     make install
@@ -206,8 +304,8 @@ echo "==> Building static libvisio ${BARE_VERSION} (unmodified upstream, ICU shi
         --prefix="$PREFIX" \
         --enable-static --disable-shared \
         --disable-tests --without-docs --disable-tools --disable-werror \
-        CFLAGS="-O2 -fPIC" \
-        CXXFLAGS="-O2 -fPIC -std=c++17 -I${ICU_SHIM_DIR} ${EXTRA_INC} -I${PREFIX}/include/librevenge-0.0 -I${PREFIX}/include/libxml2" \
+        CFLAGS="-O2 ${PIC_FLAG}" \
+        CXXFLAGS="-O2 ${PIC_FLAG} -std=c++17 -I${ICU_SHIM_DIR} ${EXTRA_INC} -I${PREFIX}/include/librevenge-0.0 -I${PREFIX}/include/libxml2" \
         CPPFLAGS="-I${ICU_SHIM_DIR} ${EXTRA_INC} -I${PREFIX}/include/librevenge-0.0 -I${PREFIX}/include/libxml2"
     make -j"$JOBS"
     make install
@@ -246,9 +344,15 @@ libxml2=${LIBXML2_VERSION} (unmodified upstream)
 icu_mode=compile-time header shim -> visio_ucnv_*
 EOF
 
-ARCHIVE_NAME="libvisio-${VERSION}-${TARGET}.tar.gz"
+if [ "$TARGET_OS" = "windows" ]; then
+    cat >> "${STAGE}/BUILD_INFO.txt" << EOF
+toolchain=$(gcc -dumpmachine 2>/dev/null || echo unknown) / MinGW-w64, msvcrt runtime
+EOF
+fi
+
+ARCHIVE_NAME="libvisio-${VERSION}-${TARGET}.${ARCHIVE_EXT}"
 ARCHIVE_PATH="${DIST_DIR}/${ARCHIVE_NAME}"
-tar -czf "$ARCHIVE_PATH" -C "$STAGE" .
+pack_archive "$STAGE" "$ARCHIVE_PATH" "$ARCHIVE_EXT"
 
 SHA="$(sha256_of "$ARCHIVE_PATH")"
 printf '%s  %s\n' "$SHA" "$ARCHIVE_NAME" > "${ARCHIVE_PATH}.sha256"

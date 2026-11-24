@@ -30,7 +30,30 @@ functions to `visio_ucnv_open`, `visio_ucnv_getNextUChar`, and
 bash libvisio/build.sh
 ```
 
-Output lands in `libvisio/dist/libvisio-<version>-<target>.tar.gz` and `.sha256`.
+Output lands in `libvisio/dist/libvisio-<version>-<target>.tar.gz` and `.sha256`
+(a `.zip` for the Windows target).
+
+## Windows
+
+Upstream only ships autotools, so MSVC is not an option: `windows-amd64` is
+built with the **MSYS2 MINGW64** (msvcrt) toolchain and ships ordinary MinGW-w64
+`.a` archives — the same runtime the Go sidecar's cgo link uses. Build it from
+an MSYS2 MINGW64 shell, not from Git Bash (autotools needs MSYS2's `make`,
+`pkg-config` and shell):
+
+```bash
+pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip
+bash libvisio/build.sh --target windows-amd64
+```
+
+The script refuses to run when `gcc` is not a MinGW-w64 compiler or the boost
+headers are missing, and warns when `MSYSTEM` is `UCRT64`/`CLANG64` (a UCRT build
+would mix two C runtimes into one binary). The archive contents match the other
+platforms — `lib/libvisio-0.1.a`, `librevenge-*.a`, `libxml2.a` — and
+`-fPIC` is dropped because MinGW-w64 has no PIC distinction.
+
+`windows-arm64` is not supported: MSYS2 has no `aarch64-w64-mingw32` gcc for an
+autotools build.
 
 ## Releasing
 
