@@ -7,23 +7,42 @@ Each dependency owns a self-contained directory at the repository root:
 ```
 .
 ├── .github/workflows/           # release pipelines (GitHub requires this path)
-│   └── onnxruntime-release.yml
-└── onnxruntime/                 # everything for this dependency
-    ├── ORT_VERSION              # pinned upstream tag, e.g. v1.29.0
-    ├── build.sh                 # build entry point
-    ├── scripts/
-    │   ├── init-submodules.sh       # fetch + pin the upstream source
-    │   ├── package.sh               # assemble the distribution archive
-    │   ├── build-macos-universal.sh # arm64 + x86_64 -> lipo
-    │   └── cross-linux-aarch64.sh   # x86_64 -> aarch64 cross build
-    ├── build/                   # build trees (git ignored)
-    ├── dist/                    # release artifacts (git ignored)
-    └── onnxruntime/             # upstream git submodule (microsoft/onnxruntime)
+│   ├── onnxruntime-release.yml
+│   ├── libvisio-release.yml
+│   └── svgrender-release.yml
+├── onnxruntime/                 # minimal static ONNX Runtime
+│   ├── ORT_VERSION              # pinned upstream tag, e.g. v1.29.0
+│   ├── build.sh                 # build entry point
+│   ├── scripts/
+│   │   ├── init-submodules.sh       # fetch + pin the upstream source
+│   │   ├── package.sh               # assemble the distribution archive
+│   │   ├── build-macos-universal.sh # arm64 + x86_64 -> lipo
+│   │   └── cross-linux-aarch64.sh   # x86_64 -> aarch64 cross build
+│   ├── build/                   # build trees (git ignored)
+│   ├── dist/                    # release artifacts (git ignored)
+│   └── onnxruntime/             # upstream git submodule (microsoft/onnxruntime)
+├── libvisio/                    # unmodified static libvisio + librevenge + libxml2
+│   ├── LIBVISIO_VERSION         # pinned upstream version, e.g. 0.1.10
+│   ├── build.sh                 # fetch, verify, build & package static archives
+│   ├── icu_shim/                # compile-time header remap (avoids ICU clashes)
+│   └── README.md
+└── svgrender/                   # standalone C-API staticlib wrapping unmodified resvg
+    ├── SVGRENDER_VERSION        # pinned upstream resvg version, e.g. 0.45.1
+    ├── Cargo.toml               # staticlib crate config
+    ├── svgrender.h              # public C API header
+    ├── src/lib.rs               # safe C FFI wrapper
+    ├── build.sh                 # build & package static archive
+    └── README.md
 ```
 
+| Dependency | Pinned version | License | Targets | Release tag |
+| --- | --- | --- | --- | --- |
+| [`onnxruntime`](#onnxruntime) | `v1.29.0` (`onnxruntime/ORT_VERSION`) | MIT | `linux-x86_64`, `linux-aarch64`, `osx-arm64`, `osx-universal` | `onnxruntime-v*` / `release-v*` |
+| [`libvisio`](#libvisio) | `0.1.10` (`libvisio/LIBVISIO_VERSION`) | MPL-2.0 / MIT | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64` | `libvisio-v*` |
+| [`svgrender`](#svgrender) | `0.45.1` (`svgrender/SVGRENDER_VERSION`) | Apache-2.0 OR MIT | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64` | `svgrender-v*` |
+
 Adding another dependency later means adding one more top-level directory plus
-one more workflow file — nothing here is onnxruntime specific except the
-directory itself.
+one more workflow file.
 
 ---
 
@@ -355,3 +374,122 @@ git -C onnxruntime/onnxruntime ls-remote --tags origin | grep -oE 'refs/tags/v[0
 - **Reproducibility.** `build.sh` re-checks out the pinned tag whenever the
   submodule work tree is clean, so a stale checkout cannot silently end up in a
   release.
+
+---
+
+## libvisio
+
+Unmodified upstream **libvisio** + **librevenge** + **libxml2** static archives
+(pinned to **0.1.10**, see [`libvisio/LIBVISIO_VERSION`](libvisio/LIBVISIO_VERSION)
+and [`libvisio/README.md`](libvisio/README.md)).
+
+### Components (zero upstream source modifications)
+
+| Component | Version | License |
+| --- | --- | --- |
+| `libvisio` | `0.1.10` | MPL-2.0 |
+| `librevenge` (`0.0`, `stream`, `generators`) | `0.0.5` | MPL-2.0 OR LGPL-2.1+ |
+| `libxml2` | `2.12.9` | MIT |
+
+Upstream `libvisio` calls 3 ICU converter functions (`ucnv_open`,
+`ucnv_getNextUChar`, `ucnv_close`). To prevent link collisions with consumers
+that statically link another ICU (e.g. `libpdfium.a`), `libvisio` is compiled
+against compile-time headers in `libvisio/icu_shim/unicode/` that remap those
+3 calls to `visio_ucnv_*` without modifying upstream sources.
+
+### Build & artifacts
+
+```bash
+# Ubuntu / Debian: sudo apt-get install -y libboost-dev pkg-config zlib1g-dev
+# macOS:           brew install boost pkg-config
+bash libvisio/build.sh
+```
+
+Output lands in `libvisio/dist/libvisio-v<version>-<target>.tar.gz` plus a
+`.sha256` file:
+
+```
+./
+├── BUILD_INFO.txt
+├── .ragflow_platform
+├── licenses/
+│   ├── libvisio-MPL-2.0.txt
+│   ├── librevenge-MPL-2.0.txt
+│   └── libxml2-MIT.txt
+├── include/
+│   ├── libvisio-0.1/
+│   └── librevenge-0.0/
+└── lib/
+    ├── libvisio-0.1.a
+    ├── librevenge-generators-0.0.a
+    ├── librevenge-stream-0.0.a
+    ├── librevenge-0.0.a
+    └── libxml2.a
+```
+
+### Releasing libvisio
+
+`.github/workflows/libvisio-release.yml` builds and smoke-tests all 4 targets
+(`linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`) — including an
+`ubuntu-22.04` glibc 2.35 portability gate — and publishes tarballs +
+`checksums.txt`.
+
+```bash
+git tag libvisio-v0.1.10 && git push origin libvisio-v0.1.10
+```
+
+Or run **Actions → libvisio release → Run workflow** (`dry_run = true` builds
+and smoke-tests without publishing).
+
+---
+
+## svgrender
+
+Standalone C-API static library (`libsvgrender.a` + `svgrender.h`) wrapping the
+unmodified upstream Rust [`resvg`](https://crates.io/crates/resvg) crate
+(pinned to **0.45.1**, **Apache-2.0 OR MIT**, see
+[`svgrender/SVGRENDER_VERSION`](svgrender/SVGRENDER_VERSION) and
+[`svgrender/README.md`](svgrender/README.md)) to rasterize SVG documents into
+white-backed PNG bytes.
+
+### Key properties
+
+- Zero upstream `resvg` source modifications.
+- Blocks all external file/network `href` image loads (inline `data:` URIs only).
+- Bounded output sizing (`max_side` and `max_pixels`).
+- Deterministic sans-serif CJK/Latin font fallback (`Noto Sans CJK SC`,
+  `Carlito`, `Liberation Sans`, `DejaVu Sans`, `WenQuanYi Zen Hei`, falling back
+  to system fonts on macOS).
+
+### Build & artifacts
+
+```bash
+bash svgrender/build.sh
+```
+
+Output lands in `svgrender/dist/svgrender-v<version>-<target>.tar.gz` plus a
+`.sha256` file:
+
+```
+./
+├── BUILD_INFO.txt
+├── .ragflow_platform
+├── include/
+│   └── svgrender.h
+└── lib/
+    └── libsvgrender.a
+```
+
+### Releasing svgrender
+
+`.github/workflows/svgrender-release.yml` builds and smoke-tests all 4 targets
+(`linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`) — including a
+PNG render smoke test and `ubuntu-22.04` glibc 2.35 portability gate — and
+publishes tarballs + `checksums.txt`.
+
+```bash
+git tag svgrender-v0.45.1 && git push origin svgrender-v0.45.1
+```
+
+Or run **Actions → svgrender release → Run workflow** (`dry_run = true` builds
+and smoke-tests without publishing).
