@@ -208,6 +208,11 @@ jobs:
 
       - name: Fetch onnxruntime ${{ needs.prepare.outputs.base_version }}
         shell: bash
+        # The submodules are public, so the script clones them anonymously first;
+        # the token is only the fallback for a fork that points them somewhere
+        # private (see the credentials block in init-submodules.sh).
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "${{ needs.prepare.outputs.base_version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"

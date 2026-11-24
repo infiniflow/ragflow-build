@@ -26,13 +26,50 @@ done
 
 cd "$REPO_ROOT"
 
+# --- credentials -------------------------------------------------------------
+# `actions/checkout` authenticates only the repository it checked out: it writes
+# an `http.https://github.com/.extraheader` entry into that repository's config,
+# and `git submodule update` replays the entries of that config into the child
+# git process through GIT_CONFIG_PARAMETERS. Git for Windows hands the replayed
+# value to the network layer mangled, GitHub answers 401 and git asks for a
+# username CI cannot supply:
+#   fatal: could not read Username for 'https://github.com'
+#   fatal: Cannot prompt because user interactivity has been disabled
+# The submodules are public upstream repositories, so the inherited credentials
+# are not needed: drop the replay variable and fall back to the workflow token
+# only if anonymous access is refused.
+unset GIT_CONFIG_PARAMETERS
+export GIT_TERMINAL_PROMPT=0
+
+SUBMODULE_TOKEN_ARGS=()
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    SUBMODULE_TOKEN_ARGS=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\r\n')")
+fi
+
+submodule_update() {
+    if git submodule update "$@"; then
+        return 0
+    fi
+    echo "==> submodule update failed; checking the credentials in play" >&2
+    if git config --get-all 'http.https://github.com/.extraheader' >/dev/null 2>&1; then
+        echo "    the parent repository still carries an http.extraheader entry" >&2
+    fi
+    if [ ${#SUBMODULE_TOKEN_ARGS[@]} -gt 0 ]; then
+        echo "==> retrying with the workflow token" >&2
+        git "${SUBMODULE_TOKEN_ARGS[@]}" submodule update "$@"
+        return
+    fi
+    echo "error: submodule update failed and GITHUB_TOKEN is not set to retry" >&2
+    return 1
+}
+
 echo "==> syncing submodules"
 git submodule sync --recursive
 
 if [ "$SHALLOW" -eq 1 ]; then
-    git submodule update --init --depth 1 "$ORT_SUBMODULE" || git submodule update --init "$ORT_SUBMODULE"
+    submodule_update --init --depth 1 "$ORT_SUBMODULE" || submodule_update --init "$ORT_SUBMODULE"
 else
-    git submodule update --init "$ORT_SUBMODULE"
+    submodule_update --init "$ORT_SUBMODULE"
 fi
 
 cd "$ORT_SUBMODULE"
@@ -61,10 +98,10 @@ fi
 
 echo "==> fetching recursive dependencies"
 if [ "$FULL" -eq 1 ]; then
-    git submodule update --init --recursive
+    submodule_update --init --recursive
 else
-    git submodule update --init --recursive --depth 1 --jobs 8 \
-        || git submodule update --init --recursive
+    submodule_update --init --recursive --depth 1 --jobs 8 \
+        || submodule_update --init --recursive
 fi
 
 echo "==> onnxruntime ready at $(pwd) ($(git rev-parse HEAD))"
