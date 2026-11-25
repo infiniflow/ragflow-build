@@ -55,8 +55,11 @@ env:
   #
   # A pull request builds only PR_TARGETS: reviewing a change should not spend
   # hours rebuilding every published platform (the full matrix still runs on a
-  # tag push and on an unfiltered workflow_dispatch).
-  PR_TARGETS: windows-x64
+  # tag push and on an unfiltered workflow_dispatch). Both Windows legs are in
+  # that list on purpose: arm64 cross-compiles through a different generator and
+  # toolset and packages the same way, so it must be exercised before the merge
+  # rather than after it.
+  PR_TARGETS: windows-x64,windows-arm64
   TARGET_MATRIX: |
     [
       {"target": "linux-x86_64", "variant": "minimal", "os": "ubuntu-22.04"},
