@@ -180,6 +180,34 @@ detect_target() {
     esac
 }
 
+# onnxruntime's build.py pins the VS generator to "Visual Studio 17 2022" when no
+# generator is given, so a runner image that only carries a newer Visual Studio
+# dies in CMake configure with
+#   Generator Visual Studio 17 2022 could not find any instance of Visual Studio
+# build.py also refuses Ninja for arm64 cross builds (it needs the generator's
+# -A ARM64), so on Windows the generator name has to match what is installed.
+vs_generator() {
+    local vswhere version major gen
+    for vswhere in \
+        "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" \
+        "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"; do
+        [ -x "$vswhere" ] || continue
+        version="$("$vswhere" -latest -property installationVersion 2>/dev/null | tr -d '\r' | head -1)"
+        major="${version%%.*}"
+        case "$major" in
+            17) gen="Visual Studio 17 2022" ;;
+            18) gen="Visual Studio 18 2026" ;;
+            *)  continue ;;
+        esac
+        # A generator this cmake does not know fails deep inside configure.
+        if cmake --help 2>/dev/null | grep -Fq -- "$gen"; then
+            printf '%s\n' "$gen"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # onnxruntime translation units are memory hungry (~1-1.5 GB each). On a box
 # with little free RAM, building with one job per core gets OOM killed, so cap
 # the default when memory is tight. --jobs always wins.
@@ -381,6 +409,14 @@ if ! printf '%s\n' "${USER_ARGS[@]}" | grep -qx -- "--cmake_generator"; then
     fi
     if [ "$want_ninja" -eq 1 ]; then
         ORT_ARGS+=(--cmake_generator Ninja)
+    elif [ "$(host_os)" = "windows" ]; then
+        # Leaving the generator out lets build.py pin "Visual Studio 17 2022",
+        # which a runner image carrying a newer VS does not have.
+        if gen="$(vs_generator)"; then
+            ORT_ARGS+=(--cmake_generator "$gen")
+        else
+            die "no Visual Studio CMake generator matches this host; pass --cmake_generator explicitly (e.g. \"Visual Studio 18 2026\")"
+        fi
     fi
 fi
 
