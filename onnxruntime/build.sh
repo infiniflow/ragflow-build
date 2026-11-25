@@ -315,6 +315,21 @@ case " $SUPPORTED_TARGETS " in
     *) die "unsupported target '$TARGET' (supported: $SUPPORTED_TARGETS)" ;;
 esac
 
+# --- MSVC: no debug information in the archive -------------------------------
+# A Visual Studio build leaves CodeView in the objects whenever the MSVC debug
+# information format resolves to "Embedded" (/Z7), and package.sh merges those
+# objects verbatim. Nothing consumes debug info from a release archive, and the
+# MSVC targets were coming back several times the size of the identical minimal
+# build on the other platforms, so the format is pinned to empty for them: no
+# /Zi, no /Z7, no PDB reference in the merged .lib. Empty is the documented way
+# to say "no debug information"; whether the consumer's own link emits any stays
+# its decision.
+case "$TARGET" in
+    windows-*)
+        DEFAULT_CMAKE_DEFINES+=("CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=")
+        ;;
+esac
+
 # ---------------------------------------------------------------------------
 # sanity checks
 # ---------------------------------------------------------------------------
@@ -376,10 +391,16 @@ while [ $i -lt ${#DEFAULT_KV[@]} ]; do
     i=$((i + 2))
 done
 
-# merge cmake defines: defaults first so user values win
-for def in "${DEFAULT_CMAKE_DEFINES[@]}" ${USER_CMAKE_DEFINES[@]+"${USER_CMAKE_DEFINES[@]}"}; do
-    ORT_ARGS+=(--cmake_extra_defines "$def")
-done
+# merge cmake defines: defaults first so user values win.
+#
+# One --cmake_extra_defines occurrence carrying every -D value. build.py
+# declares the option nargs="+", so a SECOND occurrence replaces the first
+# instead of adding to it: with the two defaults below,
+# onnxruntime_BUILD_SHARED_LIB=OFF used to be swallowed by the one after it.
+CMAKE_DEFINES=("${DEFAULT_CMAKE_DEFINES[@]}" ${USER_CMAKE_DEFINES[@]+"${USER_CMAKE_DEFINES[@]}"})
+if [ ${#CMAKE_DEFINES[@]} -gt 0 ]; then
+    ORT_ARGS+=(--cmake_extra_defines "${CMAKE_DEFINES[@]}")
+fi
 
 # Prefer ninja wherever it can drive the compiler. On Windows that means a
 # configured MSVC environment (`cl` on PATH: a developer prompt locally,

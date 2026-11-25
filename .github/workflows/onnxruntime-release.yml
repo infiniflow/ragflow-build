@@ -231,16 +231,23 @@ jobs:
       # what actually changes the artifacts (ORT version, build.sh, operator
       # config, patches), so a smoke-test or packaging tweak no longer costs a
       # full rebuild.
+      #
+      # The `v2` segment retires every tree cached before the MSVC targets stopped
+      # emitting debug information (build.sh pins
+      # CMAKE_MSVC_DEBUG_INFORMATION_FORMAT to empty): those .lib archives carry
+      # CodeView in their objects and no reconfigure can remove it, so the old
+      # entries must not be restored. Bump it again whenever a change alters the
+      # object files rather than the packaging.
       - name: Restore the build tree
         id: ort-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.ORT_PKG }}/build/${{ matrix.target }}
-          key: ort-build-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-${{ hashFiles('onnxruntime/build.sh', 'onnxruntime/required_operators.config', 'onnxruntime/patches/**') }}
+          key: ort-build-v2-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-${{ hashFiles('onnxruntime/build.sh', 'onnxruntime/required_operators.config', 'onnxruntime/patches/**') }}
           # A changed input still reuses the old tree: CMake reconfigures and only
           # what the change actually affects is recompiled.
           restore-keys: |
-            ort-build-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-
+            ort-build-v2-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-
 
       # A fresh checkout is newer than every object in the restored tree, which
       # would make ninja rebuild all of it. Dating the sources back keeps the
