@@ -3,6 +3,10 @@
 # Fetch the onnxruntime submodule and pin it to the version recorded in
 # onnxruntime/ORT_VERSION, then pull the recursive build dependencies.
 #
+# The source comes from the gitcode.com mirror of the upstream repository, as
+# recorded in the repo root `.gitmodules`: github.com/microsoft/onnxruntime is
+# no longer reachable and the mirror is the only place the tree is published.
+#
 # Handles the shallow-clone case where the tag ref is not fetched by default.
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -19,7 +23,7 @@ for arg in "$@"; do
     case "$arg" in
         --full)   FULL=1; SHALLOW=0 ;;
         --depth)  SHALLOW=1 ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
         *) echo "error: unknown option $arg" >&2; exit 1 ;;
     esac
 done
@@ -28,16 +32,18 @@ cd "$REPO_ROOT"
 
 # --- credentials -------------------------------------------------------------
 # `actions/checkout` authenticates only the repository it checked out: it writes
-# an `http.https://github.com/.extraheader` entry into that repository's config,
-# and `git submodule update` replays the entries of that config into the child
-# git process through GIT_CONFIG_PARAMETERS. Git for Windows hands the replayed
-# value to the network layer mangled, GitHub answers 401 and git asks for a
-# username CI cannot supply:
-#   fatal: could not read Username for 'https://github.com'
-#   fatal: Cannot prompt because user interactivity has been disabled
+# `http.https://github.com/.extraheader` into that repository's config.
+# `git submodule update` reads that entry from the parent config and replays it
+# into the child clone -- not through the environment, so unsetting
+# GIT_CONFIG_PARAMETERS changes nothing. On Git for Windows the replayed value
+# breaks the request (GitHub answers 401 and git asks for a username CI cannot
+# supply), and adding a second header on top makes the request carry two
+# Authorization headers, which GitHub reports as "Repository not found".
+#
 # The submodules are public upstream repositories, so the inherited credentials
-# are not needed: drop the replay variable and fall back to the workflow token
-# only if anonymous access is refused.
+# are not needed at all: delete them and authenticate with the workflow token as
+# the only header, and only if anonymous access is refused.
+git config --local --unset-all 'http.https://github.com/.extraheader' 2>/dev/null || true
 unset GIT_CONFIG_PARAMETERS
 export GIT_TERMINAL_PROMPT=0
 
@@ -50,12 +56,8 @@ submodule_update() {
     if git submodule update "$@"; then
         return 0
     fi
-    echo "==> submodule update failed; checking the credentials in play" >&2
-    if git config --get-all 'http.https://github.com/.extraheader' >/dev/null 2>&1; then
-        echo "    the parent repository still carries an http.extraheader entry" >&2
-    fi
     if [ ${#SUBMODULE_TOKEN_ARGS[@]} -gt 0 ]; then
-        echo "==> retrying with the workflow token" >&2
+        echo "==> anonymous clone refused, retrying with the workflow token" >&2
         git "${SUBMODULE_TOKEN_ARGS[@]}" submodule update "$@"
         return
     fi
@@ -63,26 +65,67 @@ submodule_update() {
     return 1
 }
 
-echo "==> syncing submodules"
-git submodule sync --recursive
+# `.gitmodules` is the only place the source URL lives (no second copy here), so
+# a missing entry is an error rather than a silent fallback to the dead upstream.
+ORT_GIT_URL="$(git config -f .gitmodules --get "submodule.${ORT_SUBMODULE}.url" 2>/dev/null || true)"
+if [ -z "$ORT_GIT_URL" ]; then
+    echo "error: submodule.${ORT_SUBMODULE}.url is missing from .gitmodules" >&2
+    exit 1
+fi
 
-if [ "$SHALLOW" -eq 1 ]; then
-    submodule_update --init --depth 1 "$ORT_SUBMODULE" || submodule_update --init "$ORT_SUBMODULE"
+# `git clone` runs as its own repository: it reads the global configuration
+# only, so the parent `.git/config` (and the credentials `actions/checkout` put
+# there) never reach it. A fresh CI workspace has nothing to update, so clone
+# directly instead of going through `git submodule`, which is exactly the path
+# that replays the parent config into the child git process.
+clone_ort_directly() {
+    local depth=()
+    [ "$SHALLOW" -eq 1 ] && depth=(--depth 1)
+    echo "==> cloning $ORT_GIT_URL at $ORT_VERSION"
+    rm -rf "$ORT_SUBMODULE"
+    mkdir -p "$(dirname "$ORT_SUBMODULE")"
+    if git clone ${depth[@]+"${depth[@]}"} --branch "$ORT_VERSION" "$ORT_GIT_URL" "$ORT_SUBMODULE"; then
+        return 0
+    fi
+    [ ${#SUBMODULE_TOKEN_ARGS[@]} -gt 0 ] || return 1
+    echo "==> anonymous clone refused, retrying with the workflow token" >&2
+    rm -rf "$ORT_SUBMODULE"
+    git "${SUBMODULE_TOKEN_ARGS[@]}" clone ${depth[@]+"${depth[@]}"} \
+        --branch "$ORT_VERSION" "$ORT_GIT_URL" "$ORT_SUBMODULE"
+}
+
+# A submodule that is already initialised has its git directory here. Updating
+# it is the normal developer flow and keeps the working tree a real submodule;
+# only a fresh workspace takes the clone path above.
+if [ -d "$REPO_ROOT/.git/modules/$ORT_SUBMODULE" ]; then
+    echo "==> syncing submodules"
+    git submodule sync --recursive
+    if [ "$SHALLOW" -eq 1 ]; then
+        submodule_update --init --depth 1 "$ORT_SUBMODULE" \
+            || submodule_update --init "$ORT_SUBMODULE" \
+            || clone_ort_directly
+    else
+        submodule_update --init "$ORT_SUBMODULE" || clone_ort_directly
+    fi
 else
-    submodule_update --init "$ORT_SUBMODULE"
+    clone_ort_directly
 fi
 
 cd "$ORT_SUBMODULE"
 
 echo "==> pinning onnxruntime to $ORT_VERSION"
-git fetch --depth 1 origin "refs/tags/${ORT_VERSION}:refs/tags/${ORT_VERSION}" \
-    || git fetch origin --tags --force
+# The clone above already carries the tag; only a pre-existing submodule
+# worktree (shallow, no tags) needs the explicit fetch.
+if ! git rev-parse -q --verify "refs/tags/${ORT_VERSION}" >/dev/null 2>&1; then
+    git fetch --depth 1 origin "refs/tags/${ORT_VERSION}:refs/tags/${ORT_VERSION}" \
+        || git fetch origin --tags --force
+fi
 git checkout --detach "$ORT_VERSION"
 
-# Apply vendored patches on top of the pinned tag. The upstream onnxruntime is
-# pristine microsoft/onnxruntime; custom changes (e.g. the shared-initializer
-# APIs) live as patches under onnxruntime/patches so they survive a clean
-# checkout and the CI rebuild (which re-fetches the upstream tag from scratch).
+# Apply vendored patches on top of the pinned tag. The upstream tree is the
+# pristine onnxruntime (mirrored on gitcode.com); custom changes (e.g. the
+# shared-initializer APIs) live as patches under onnxruntime/patches so they
+# survive a clean checkout and the CI rebuild (which re-fetches the tag).
 PATCH_DIR="$PKG_DIR/patches"
 if [ -d "$PATCH_DIR" ]; then
     shopt -s nullglob

@@ -1,4 +1,4 @@
 [submodule "onnxruntime/onnxruntime"]
 	path = onnxruntime/onnxruntime
-	url = https://github.com/microsoft/onnxruntime.git
+	url = https://gitcode.com/gh_mirrors/on/onnxruntime.git
 	branch = v1.29.0

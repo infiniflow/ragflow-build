@@ -20,7 +20,7 @@ Each dependency owns a self-contained directory at the repository root:
 │   │   └── cross-linux-aarch64.sh   # x86_64 -> aarch64 cross build
 │   ├── build/                   # build trees (git ignored)
 │   ├── dist/                    # release artifacts (git ignored)
-│   └── onnxruntime/             # upstream git submodule (microsoft/onnxruntime)
+│   └── onnxruntime/             # upstream git submodule (gitcode.com mirror)
 ├── libvisio/                    # unmodified static libvisio + librevenge + libxml2
 │   ├── LIBVISIO_VERSION         # pinned upstream version, e.g. 0.1.10
 │   ├── build.sh                 # fetch, verify, build & package static archives
@@ -106,6 +106,14 @@ and uploads artifacts without publishing.
 
 Pinned to **v1.29.0** (see `onnxruntime/ORT_VERSION`).
 
+**The source comes from the gitcode.com mirror**, not from
+`github.com/microsoft/onnxruntime`: that repository now answers
+`Repository not found`, so the tree is fetched from
+`https://gitcode.com/gh_mirrors/on/onnxruntime.git` instead (see the repo root
+`.gitmodules`). The mirror is a faithful copy — its `v1.29.0` tag is the same
+commit this repo previously pinned. Upstream publishes shared libraries only,
+so the static libraries shipped here are built from that source in CI.
+
 ### 1. Get the sources
 
 ```bash
@@ -116,6 +124,11 @@ bash onnxruntime/scripts/init-submodules.sh
 
 This registers the submodule, checks out exactly the tag in `ORT_VERSION` and
 pulls the recursive build dependencies. Use `--full` for an unshallow clone.
+
+The build dependencies are not vendored in the mirror: `cmake/deps.txt` points
+at the third-party repositories (abseil, onnx, protobuf, flatbuffers, eigen,
+cpuinfo, ...), none of which live under `microsoft/onnxruntime`, so the build
+still resolves them while the upstream tree is gone.
 
 ### 2. Build
 

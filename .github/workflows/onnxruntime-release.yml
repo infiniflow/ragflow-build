@@ -107,10 +107,11 @@ jobs:
             *) echo "::error::version '$version' must start with 'v' (e.g. v1.29.0)"; exit 1 ;;
           esac
 
-          # The upstream onnxruntime is fetched from microsoft/onnxruntime, where
-          # only real releases exist (e.g. v1.29.0). A release tag may carry a
-          # vendor suffix like -patch1; strip it to get the tag we actually fetch
-          # and build (the patch is applied on top by init-submodules.sh).
+          # The upstream onnxruntime is fetched from the gitcode.com mirror (see
+          # .gitmodules; github.com/microsoft/onnxruntime is gone), where only
+          # real releases exist (e.g. v1.29.0). A release tag may carry a vendor
+          # suffix like -patch1; strip it to get the tag we actually fetch and
+          # build (the patch is applied on top by init-submodules.sh).
           base_version="${version%-*}"
           [ "$base_version" != "$version" ] && \
             echo "::notice::release tag '$version' -> fetching upstream '$base_version' + vendored patches"
