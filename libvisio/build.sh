@@ -18,7 +18,7 @@
 # sidecar's cgo link uses. Upstream only has autotools, so MSVC is not an option
 # here; the archives carry the msvcrt-based MinGW64 runtime, matching Go's cgo
 # toolchain. Run it from an MSYS2 MINGW64 shell (pacman -S
-# mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip).
+# mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost make pkgconf zip).
 #
 # Bash 3.2 compatible (macOS default bash) and Windows/Git Bash compatible.
 # -----------------------------------------------------------------------------
@@ -164,15 +164,14 @@ pack_archive() {
                 ( cd "$stage" && zip -q -r -y "$out" . )
                 return 0
             fi
-            if command -v powershell >/dev/null 2>&1; then
-                local win_stage win_out
-                win_stage="$(cygpath -w "$stage")"
-                win_out="$(cygpath -w "$out")"
-                powershell -NoProfile -NonInteractive -Command \
-                    "Compress-Archive -Path '${win_stage}\\*' -DestinationPath '${win_out}' -Force"
+            # bsdtar's -a picks the zip writer from the .zip suffix and names
+            # entries with forward slashes. PowerShell's Compress-Archive writes
+            # backslashes as path separators, which makes unzip warn and exit 1.
+            if tar --version 2>/dev/null | grep -qi bsdtar; then
+                ( cd "$stage" && tar -a -cf "$out" . )
                 return 0
             fi
-            die "creating ${out##*/} needs 'zip' (MSYS2: pacman -S zip) or PowerShell"
+            die "creating ${out##*/} needs Info-ZIP 'zip' or bsdtar (MSYS2: pacman -S zip)"
             ;;
         *)
             tar -czf "$out" -C "$stage" .
@@ -192,11 +191,14 @@ preflight_windows() {
         *) die "windows-amd64 must be built on Windows from an MSYS2 MINGW64 shell" ;;
     esac
 
+    # m4 is not part of the toolchain packages, but the windres shim
+    # (build/win32/lt-compile-resource) runs it over every .rc file, so a build
+    # without it dies minutes in at the resource step.
     local tool
-    for tool in gcc g++ make pkg-config; do
+    for tool in gcc g++ make pkg-config windres m4; do
         command -v "$tool" >/dev/null 2>&1 \
             || die "missing $tool: run this from the MSYS2 MINGW64 shell with
-       'pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip'"
+       'pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost make pkgconf m4 zip'"
     done
 
     case "$(gcc -dumpmachine 2>/dev/null || true)" in
@@ -297,16 +299,22 @@ echo "==> Building static libvisio ${BARE_VERSION} (unmodified upstream, ICU shi
     touch src/lib/tokens.gperf
     sleep 1
     touch src/lib/tokens.h src/lib/tokenhash.h
+    # libxml2 is built --disable-shared, so every object that includes its
+    # headers has to see LIBXML_STATIC: xmlexports.h otherwise declares the API
+    # __declspec(dllimport) on Windows and the objects reference __imp_xml*,
+    # which a static libxml2.a cannot satisfy. libxml2's pkg-config carries the
+    # define in Cflags.private, which the LIBXML_CFLAGS override below drops, so
+    # it also goes into CPPFLAGS where it reaches every compile.
     PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig" \
     ICU_CFLAGS="-I${ICU_SHIM_DIR}" ICU_LIBS=" " \
-    LIBXML_CFLAGS="-I${PREFIX}/include/libxml2" LIBXML_LIBS=" " \
+    LIBXML_CFLAGS="-I${PREFIX}/include/libxml2 -DLIBXML_STATIC" LIBXML_LIBS=" " \
     ./configure \
         --prefix="$PREFIX" \
         --enable-static --disable-shared \
         --disable-tests --without-docs --disable-tools --disable-werror \
         CFLAGS="-O2 ${PIC_FLAG}" \
         CXXFLAGS="-O2 ${PIC_FLAG} -std=c++17 -I${ICU_SHIM_DIR} ${EXTRA_INC} -I${PREFIX}/include/librevenge-0.0 -I${PREFIX}/include/libxml2" \
-        CPPFLAGS="-I${ICU_SHIM_DIR} ${EXTRA_INC} -I${PREFIX}/include/librevenge-0.0 -I${PREFIX}/include/libxml2"
+        CPPFLAGS="-DLIBXML_STATIC -I${ICU_SHIM_DIR} ${EXTRA_INC} -I${PREFIX}/include/librevenge-0.0 -I${PREFIX}/include/libxml2"
     make -j"$JOBS"
     make install
 )

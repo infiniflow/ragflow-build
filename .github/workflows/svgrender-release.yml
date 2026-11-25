@@ -125,17 +125,43 @@ jobs:
         with:
           submodules: false
 
-      - name: Setup MinGW-w64 (windows)
+      # Unpacks MSYS2 only. The packages are installed by the next step, in the
+      # very shell the toolchain is then taken from: the action's own `install:`
+      # input left a cached base installation without a compiler behind, and the
+      # failure only surfaced much later as "MinGW-w64 gcc not found on PATH".
+      - name: Setup MSYS2 (windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
-          # fixed location: the build step prepends /c/msys64/mingw64/bin to PATH
-          location: C:\msys64
+          # No `location`: the action's own default is the only layout it gets
+          # right. Passing C:\msys64 explicitly made it unpack a second level,
+          # so the root became C:\msys64\msys64 and every path below was off.
+          # Nothing here hardcodes the root any more; the install step exports
+          # the root its shell actually runs in.
           msystem: MINGW64
           update: false
-          install: >-
-            mingw-w64-x86_64-gcc
-            zip
+          cache: false
+
+      - name: Install MinGW-w64 (windows, MSYS2)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm
+          pacman -S --needed --noconfirm mingw-w64-x86_64-gcc zip
+          # Assert on the installed file: the steps below are handed this very
+          # directory, so a base without the package must fail here.
+          test -x /mingw64/bin/gcc.exe || {
+            echo "::error::mingw-w64-x86_64-gcc is not installed under /mingw64"
+            pacman -Q | head -20
+            exit 1
+          }
+          gcc --version | head -1
+          gcc -dumpmachine
+          # Hand the Git Bash steps the root this shell actually runs in
+          # instead of letting them assume C:\msys64: mingw64/bin supplies gcc
+          # for rustc, usr/bin supplies the Info-ZIP `zip` used for packaging.
+          printf 'MSYS2_ROOT=%s\n' "$(cygpath -w /)" >> "$(cygpath -u "$GITHUB_ENV")"
 
       - name: Setup Rust toolchain
         if: runner.os != 'Windows'
@@ -152,9 +178,22 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ runner.os }}" = "Windows" ]; then
-            # rustc links a windows-gnu staticlib with the MinGW-w64 gcc that
-            # msys2/setup-msys2 installed; Git Bash supplies the rest.
-            export PATH="/c/msys64/mingw64/bin:$PATH"
+            # rustc links a windows-gnu staticlib with the MinGW-w64 gcc, and
+            # packaging wants Info-ZIP `zip`; both live under the MSYS2 root
+            # the install step exported. `usr/bin` is appended, not prepended:
+            # it only has to supply what Git Bash lacks, never shadow it.
+            # Assert outside the substitution: `:?` inside `$(...)` only kills
+            # the subshell and lets an empty value through.
+            : "${MSYS2_ROOT:?the MSYS2 install step exported no MSYS2_ROOT}"
+            msys_root="$(cygpath -u "$MSYS2_ROOT")"
+            test -x "$msys_root/mingw64/bin/gcc.exe" || {
+              echo "::error::no gcc under $MSYS2_ROOT\\mingw64\\bin"
+              ls "$msys_root" 2>/dev/null | head -20 || true
+              exit 1
+            }
+            export PATH="$msys_root/mingw64/bin:$PATH:$msys_root/usr/bin"
+            gcc -dumpmachine
+            command -v zip || echo "::warning::no Info-ZIP zip; packaging falls back to bsdtar"
           fi
           bash "${{ env.PKG_DIR }}/build.sh" \
             --target "${{ matrix.target }}" \
@@ -164,8 +203,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cc_bin=cc
           if [ "${{ runner.os }}" = "Windows" ]; then
-            export PATH="/c/msys64/mingw64/bin:$PATH"
+            # The same MinGW-w64 gcc the build linked with. `cc` is not what
+            # Git Bash provides, so the compiler is named explicitly.
+            : "${MSYS2_ROOT:?the MSYS2 install step exported no MSYS2_ROOT}"
+            export PATH="$(cygpath -u "$MSYS2_ROOT")/mingw64/bin:$PATH"
+            cc_bin=gcc
           fi
           # One glob per platform: `ls a/*.tar.gz b/*.zip` fails with status 2
           # whenever the second pattern matches nothing, and -o pipefail turns
@@ -227,9 +271,12 @@ jobs:
             # CNG/registry entry points; the final link has to name them.
             # -ldl is a Linux-only library, so the unix list is replaced.
             probe="$work/probe.exe"
-            libs="-lm -lws2_32 -luserenv -lbcrypt -lntdll -lole32 -lshell32 -ladvapi32"
+            # A staticlib does not carry its `#[link]` requirements into a GNU
+            # ld link, so the C side names them. -lsynchronization is what
+            # std's futex uses for WaitOnAddress/WakeByAddress* (Win8 api-set).
+            libs="-lm -lws2_32 -luserenv -lbcrypt -lntdll -lole32 -lshell32 -ladvapi32 -lsynchronization"
           fi
-          cc -o "$probe" "$work/probe.c" -I"$work/include" "$work/lib/libsvgrender.a" $libs
+          "$cc_bin" -o "$probe" "$work/probe.c" -I"$work/include" "$work/lib/libsvgrender.a" $libs
           "$probe"
 
       - name: Portability gate (nm) — linux-amd64

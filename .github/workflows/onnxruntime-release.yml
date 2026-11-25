@@ -194,13 +194,15 @@ jobs:
       - name: Install build deps
         run: python -m pip install --upgrade pip "cmake>=3.28" flatbuffers
 
-      - name: Setup Ninja (unix)
-        if: runner.os != 'Windows'
+      # Ninja on every platform: on Windows it is what keeps the build off the
+      # version-pinned "Visual Studio 17 2022" generator (upstream build.py's
+      # hardcoded default), which a newer runner image cannot satisfy.
+      - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@master
 
-      # Sets up the MSVC environment (vcvars) so CMake finds the Visual Studio
-      # generator and package.sh finds lib.exe. Without it CMake configure dies
-      # with 'could not find any instance of Visual Studio'.
+      # Sets up the MSVC environment (vcvars) so ninja finds cl, and so
+      # package.sh finds lib.exe. Without it the Windows configure/build steps
+      # have no compiler at all.
       - name: Setup MSVC (windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1

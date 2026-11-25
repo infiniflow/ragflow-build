@@ -353,11 +353,33 @@ for def in "${DEFAULT_CMAKE_DEFINES[@]}" ${USER_CMAKE_DEFINES[@]+"${USER_CMAKE_D
     ORT_ARGS+=(--cmake_extra_defines "$def")
 done
 
-# Prefer ninja on unix like hosts. On Windows the MSVC toolchain is only on the
-# PATH inside a developer prompt, so keep the default Visual Studio generator
-# there unless the caller explicitly asked for something else.
-if [ "$(host_os)" != "windows" ] && ! printf '%s\n' "${USER_ARGS[@]}" | grep -qx -- "--cmake_generator"; then
+# Prefer ninja wherever it can drive the compiler. On Windows that means a
+# configured MSVC environment (`cl` on PATH: a developer prompt locally,
+# ilammy/msvc-dev-cmd in CI), because ninja calls cl directly.
+#
+# The Visual Studio generator is the fallback and it is a trap: upstream
+# build.py pins it to "Visual Studio 17 2022" whenever no generator is given
+# (tools/ci_build/build_args.py), so a runner image that only carries a newer
+# VS dies in CMake configure with
+#   Generator Visual Studio 17 2022 could not find any instance of Visual Studio
+# Ninja has no such version coupling. Pass --cmake_generator explicitly to
+# override either choice.
+if ! printf '%s\n' "${USER_ARGS[@]}" | grep -qx -- "--cmake_generator"; then
+    want_ninja=0
     if command -v ninja >/dev/null 2>&1 || command -v ninja-build >/dev/null 2>&1; then
+        want_ninja=1
+    fi
+    if [ "$(host_os)" = "windows" ]; then
+        # No cl means no toolchain for ninja to drive: keep the VS generator,
+        # which finds its own compiler through CMake.
+        command -v cl >/dev/null 2>&1 || want_ninja=0
+        # build.py refuses cross-compilation with Ninja (arm64 needs the target
+        # toolset environment), so leave those targets on the VS generator.
+        if [ "$TARGET" = "windows-arm64" ]; then
+            want_ninja=0
+        fi
+    fi
+    if [ "$want_ninja" -eq 1 ]; then
         ORT_ARGS+=(--cmake_generator Ninja)
     fi
 fi

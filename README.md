@@ -444,10 +444,14 @@ git -C onnxruntime/onnxruntime ls-remote --tags origin | grep -oE 'refs/tags/v[0
   the mismatched host and falls back to `scripts/cross-linux-aarch64.sh`, which
   installs `crossbuild-essential-arm64` and cross compiles. Change `os` in the
   workflow matrix to switch.
-- **Windows generator.** The script deliberately keeps the default Visual
-  Studio generator on Windows; ninja is only auto-selected on unix where the
-  toolchain is already on `PATH`. Pass `--cmake_generator Ninja` from a
-  developer prompt to override.
+- **Windows generator.** Ninja is auto-selected whenever both `ninja` and `cl`
+  are on `PATH` (a developer prompt locally, `ilammy/msvc-dev-cmd` in CI).
+  Without `cl` the script falls back to the Visual Studio generator, which is
+  version-pinned by upstream: `tools/ci_build/build_args.py` hardcodes
+  `"Visual Studio 17 2022"` when no generator is passed, so a runner image
+  carrying only a newer VS fails configure with
+  `could not find any instance of Visual Studio`. Pass `--cmake_generator` to
+  override either choice.
 - **Reproducibility.** `build.sh` re-checks out the pinned tag whenever the
   submodule work tree is clean, so a stale checkout cannot silently end up in a
   release.

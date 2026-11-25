@@ -134,36 +134,71 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install boost pkg-config
 
-      - name: Install build deps (windows)
+      # Unpacks MSYS2 only. The packages are installed by the next step, in the
+      # very shell that runs the build: the action's own `install:` input left a
+      # cached base installation without a compiler behind, and the failure only
+      # surfaced much later as "missing gcc".
+      - name: Setup MSYS2 (windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
-          # fixed location: the build/smoke steps enter it as /c/msys64/usr/bin/bash
-          location: C:\msys64
+          # No `location`: passing C:\msys64 explicitly makes the action unpack a
+          # second level (C:\msys64\msys64). Nothing below needs the absolute
+          # path -- the steps run in this root's own shell.
           msystem: MINGW64
           update: false
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-boost
-            pkgconf
-            zip
-            unzip
+          cache: false
 
-      - name: Build ${{ matrix.target }}
+      - name: Install build deps (windows, MSYS2)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm
+          # m4 is what the windres shim runs over the .rc files
+          # (lt-compile-resource); it is not part of the toolchain packages.
+          pacman -S --needed --noconfirm \
+            mingw-w64-x86_64-toolchain \
+            mingw-w64-x86_64-boost \
+            mingw-w64-x86_64-zlib \
+            make pkgconf m4 zip unzip
+          # Assert on the installed file, not on PATH: this shell resolves gcc
+          # from the same prefix the build step will use, so a base without the
+          # package must fail here instead of minutes later.
+          test -x /mingw64/bin/gcc.exe || {
+            echo "::error::mingw-w64-x86_64-gcc is not installed under /mingw64"
+            pacman -Q | head -20
+            exit 1
+          }
+          gcc --version | head -1
+          gcc -dumpmachine
+
+      - name: Build ${{ matrix.target }} (windows, MSYS2)
+        if: matrix.target == 'windows-amd64'
+        # autotools needs the whole MSYS2 userland (make, pkg-config, sh, ar), and
+        # this is the same shell the packages were installed into: no manual
+        # `C:\msys64\usr\bin\bash -lc` indirection, no PATH guessing.
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          command -v gcc || {
+            echo "::error::gcc missing from the MSYS2 MINGW64 shell"
+            echo "PATH=$PATH"
+            pacman -Q mingw-w64-x86_64-gcc || true
+            exit 1
+          }
+          bash "${{ env.PKG_DIR }}/build.sh" \
+            --target 'windows-amd64' \
+            --version '${{ needs.prepare.outputs.version }}'
+
+      - name: Build ${{ matrix.target }} (posix)
+        if: matrix.target != 'windows-amd64'
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.target }}" = "windows-amd64" ]; then
-            # autotools needs the whole MSYS2 userland (make, pkg-config, sh, ar),
-            # so the build runs inside the MINGW64 login shell; MSYSTEM there
-            # selects the msvcrt toolchain the Go sidecar links against.
-            MSYSTEM=MINGW64 CHERE_INVOKING=1 /c/msys64/usr/bin/bash -lc \
-              "bash '$PWD/${{ env.PKG_DIR }}/build.sh' --target 'windows-amd64' --version '${{ needs.prepare.outputs.version }}'"
-          else
-            bash "${{ env.PKG_DIR }}/build.sh" \
-              --target "${{ matrix.target }}" \
-              --version "${{ needs.prepare.outputs.version }}"
-          fi
+          bash "${{ env.PKG_DIR }}/build.sh" \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.prepare.outputs.version }}"
 
       - name: Write the smoke probe script
         shell: bash
@@ -216,18 +251,16 @@ jobs:
           }
           EOF
 
-          # libxml2 is configured --without-zlib / --without-iconv, so the probe
-          # links nothing beyond the archives themselves. Windows keeps the C++
-          # runtime static so the probe binary is self-contained.
-          libs=""
+          # libxml2 itself is configured --without-zlib, but librevenge-stream's
+          # RVNGZipStream inflates the zip parts embedded in a vsdx/vsdm, so
+          # zlib is required on every platform. Windows additionally keeps the
+          # C++ runtime static.
+          libs="-lz"
           probe="$work/probe"
           case "$(uname -s)" in
             MINGW*|MSYS*|CYGWIN*)
-              libs="-static-libgcc -static-libstdc++"
+              libs="-lz -static-libgcc -static-libstdc++"
               probe="$work/probe.exe"
-              ;;
-            *)
-              libs="-lz"
               ;;
           esac
 

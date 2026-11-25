@@ -143,7 +143,8 @@ sha256_of() {
 }
 
 # Windows consumers expect a .zip (PowerShell's Expand-Archive handles nothing
-# else); POSIX keeps the .tar.gz it has always shipped.
+# else); POSIX keeps the .tar.gz it has always shipped. Only windows-amd64 packs
+# a zip, so the zip branch only ever runs on a Windows host.
 pack_archive() {
     local stage="$1" out="$2" ext="$3"
     rm -f "$out"
@@ -153,15 +154,16 @@ pack_archive() {
                 ( cd "$stage" && zip -q -r -y "$out" . )
                 return 0
             fi
-            if command -v powershell >/dev/null 2>&1; then
-                local win_stage win_out
-                win_stage="$(cygpath -w "$stage")"
-                win_out="$(cygpath -w "$out")"
-                powershell -NoProfile -NonInteractive -Command \
-                    "Compress-Archive -Path '${win_stage}\\*' -DestinationPath '${win_out}' -Force"
+            # Git Bash ships bsdtar, whose -a picks the zip writer from the
+            # .zip suffix and names entries with forward slashes. PowerShell's
+            # Compress-Archive is not an option: it writes backslashes as path
+            # separators, which makes unzip warn and exit 1 and every consumer
+            # extract one flat file per entry.
+            if tar --version 2>/dev/null | grep -qi bsdtar; then
+                ( cd "$stage" && tar -a -cf "$out" . )
                 return 0
             fi
-            die "creating ${out##*/} needs 'zip' (MSYS2: pacman -S zip) or PowerShell"
+            die "creating ${out##*/} needs Info-ZIP 'zip' or bsdtar (MSYS2: pacman -S zip)"
             ;;
         *)
             tar -czf "$out" -C "$stage" .
