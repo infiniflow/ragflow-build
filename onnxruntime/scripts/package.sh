@@ -343,6 +343,25 @@ merge_libs "$STAGE_DIR/lib/$LIB_NAME" "${ORDERED[@]}"
 
 [ -s "$STAGE_DIR/lib/$LIB_NAME" ] || { echo "error: merged library is empty" >&2; exit 1; }
 
+# The zip size alone cannot say whether an archive is large because its objects
+# are large or because its member list is: report the merged library and how many
+# objects went into it. `ar t` reads standard archives on every platform, but GNU
+# ar is not on every Windows runner, so the MSVC librarian is the fallback there.
+lib_bytes="$(wc -c < "$STAGE_DIR/lib/$LIB_NAME" | tr -d ' ')"
+lib_members="$(ar t "$STAGE_DIR/lib/$LIB_NAME" 2>/dev/null | wc -l | tr -d ' ')" || lib_members=""
+case "$TARGET" in
+    windows-*)
+        if [ -z "$lib_members" ] || [ "$lib_members" = "0" ]; then
+            if lib_exe="$(find_msvc_lib 2>/dev/null)"; then
+                lib_members="$(MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+                    "$lib_exe" -NOLOGO -LIST "$(to_win "$STAGE_DIR/lib/$LIB_NAME")" 2>/dev/null \
+                    | grep -c '\.obj$')" || lib_members=""
+            fi
+        fi
+        ;;
+esac
+echo "==> $LIB_NAME: $((lib_bytes / 1048576)) MB uncompressed, ${lib_members:-unknown} members"
+
 # --- metadata ----------------------------------------------------------------
 [ -f "$SOURCE_DIR/LICENSE" ] && cp -f "$SOURCE_DIR/LICENSE" "$STAGE_DIR/LICENSE"
 
