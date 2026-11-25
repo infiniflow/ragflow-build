@@ -48,9 +48,10 @@ env:
   #   linux-x86_64: ubuntu-22.04 pins glibc 2.35 / GCC 11.4 for the consumers.
   #   windows-x64 : MSVC build (upstream ORT has no MinGW support), ships
   #                 lib/onnxruntime.lib and needs lib.exe for packaging.
-  # windows-arm64 exists in build.sh/package.sh but stays out of the matrix: it
-  # needs the same x64 runner plus the arm64 MSVC cross tools, and nothing
-  # consumes it yet.
+  #   windows-arm64: same x64 runner, arm64 MSVC cross tools
+  #                 (ilammy/msvc-dev-cmd arch amd64_arm64), VS generator because
+  #                 ORT's build.py refuses to cross-compile with Ninja. The smoke
+  #                 test only links: an x64 runner cannot execute an arm64 binary.
   #
   # A pull request builds only PR_TARGETS: reviewing a change should not spend
   # hours rebuilding every published platform (the full matrix still runs on a
@@ -62,7 +63,8 @@ env:
       {"target": "linux-aarch64", "variant": "minimal", "os": "ubuntu-24.04-arm"},
       {"target": "osx-arm64", "variant": "minimal", "os": "macos-latest"},
       {"target": "osx-universal", "variant": "minimal", "os": "macos-latest"},
-      {"target": "windows-x64", "variant": "minimal", "os": "windows-latest"}
+      {"target": "windows-x64", "variant": "minimal", "os": "windows-latest"},
+      {"target": "windows-arm64", "variant": "minimal", "os": "windows-latest"}
     ]
 
 jobs:
@@ -221,6 +223,54 @@ jobs:
           echo "${{ needs.prepare.outputs.base_version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"
           bash "${{ env.ORT_PKG }}/scripts/init-submodules.sh"
 
+      # Ninja only rebuilds targets older than their inputs, so the whole tree is
+      # cached: CMake's cache, the fetched _deps and every object. The key covers
+      # what actually changes the artifacts (ORT version, build.sh, operator
+      # config, patches), so a smoke-test or packaging tweak no longer costs a
+      # full rebuild.
+      - name: Restore the build tree
+        id: ort-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ORT_PKG }}/build/${{ matrix.target }}
+          key: ort-build-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-${{ hashFiles('onnxruntime/build.sh', 'onnxruntime/required_operators.config', 'onnxruntime/patches/**') }}
+          # A changed input still reuses the old tree: CMake reconfigures and only
+          # what the change actually affects is recompiled.
+          restore-keys: |
+            ort-build-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-
+
+      # A fresh checkout is newer than every object in the restored tree, which
+      # would make ninja rebuild all of it. Dating the sources back keeps the
+      # restored tree newer than its inputs.
+      - name: Age the sources so the restored tree stays incremental
+        if: steps.ort-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${{ env.ORT_PKG }}/onnxruntime"
+          [ -d "$src" ] || exit 0
+          find "$src" -type f \
+            \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+               -o -name '*.h' -o -name '*.hpp' -o -name '*.hxx' \) \
+            -exec touch -t 200001010000 {} +
+          # Directories carry the mtime CMake's glob verification compares, so
+          # they are dated back as well; otherwise a fresh checkout makes CMake
+          # think a GLOB changed and reconfigure from scratch.
+          find "$src" -type d -exec touch -t 200001010000 {} +
+
+          # The cached CMakeCache records the cmake that configured it; a runner
+          # image update can remove that version. Dropping only the cache lets
+          # CMake reconfigure while every restored object stays reusable.
+          for cache in "${{ env.ORT_PKG }}/build/${{ matrix.target }}"/*/CMakeCache.txt; do
+            [ -f "$cache" ] || continue
+            tool="$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$cache" | head -1)"
+            if [ -z "$tool" ] || [ -e "$tool" ]; then
+              continue
+            fi
+            echo "dropping $cache: cached cmake '$tool' no longer exists"
+            rm -f "$cache"
+          done
+
       - name: Build ${{ matrix.target }}
         shell: bash
         run: |
@@ -233,6 +283,15 @@ jobs:
           # --disable_contrib_ops is intentionally NOT used: the DeepDoc weights
           # need the com.microsoft fused kernels listed in that config.
           bash "${{ env.ORT_PKG }}/build.sh" --target "${{ matrix.target }}"
+
+      # Saved here, not at job teardown: a failing smoke test or a rejected
+      # release must not throw the compilation away.
+      - name: Save the build tree
+        if: success() && steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ORT_PKG }}/build/${{ matrix.target }}
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
 
       - name: Smoke test (load the DeepDoc models)
         # A build that compiles fine can still be unable to load the models it
@@ -272,16 +331,26 @@ jobs:
             echo "::error::no packaged ONNX Runtime library under $root/lib"; exit 1
           fi
 
+          # An x64 runner cannot execute an arm64 binary (Windows emulates only
+          # the other direction), so the arm64 leg stops after linking the probe:
+          # no model is downloaded or loaded there.
+          run_probe=1
+          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+            run_probe=0
+          fi
+
           models="$work/models"
           mkdir -p "$models"
-          for m in $DEEPDOC_MODELS; do
-            # --retry alone does not cover transport errors such as
-            # "SSL_ERROR_SYSCALL", and a flaky download must not fail a release.
-            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
-              -o "$models/$m.ort" \
-              "$HF_ENDPOINT/InfiniFlow/deepdoc/resolve/main/$m.ort" \
-              || { echo "::error::failed to download $m.ort"; exit 1; }
-          done
+          if [ "$run_probe" -eq 1 ]; then
+            for m in $DEEPDOC_MODELS; do
+              # --retry alone does not cover transport errors such as
+              # "SSL_ERROR_SYSCALL", and a flaky download must not fail a release.
+              curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
+                -o "$models/$m.ort" \
+                "$HF_ENDPOINT/InfiniFlow/deepdoc/resolve/main/$m.ort" \
+                || { echo "::error::failed to download $m.ort"; exit 1; }
+            done
+          fi
 
           cat > "$work/probe.c" <<'EOF'
           #include <stdio.h>
@@ -289,9 +358,25 @@ jobs:
           int main(int argc, char **argv) {
               const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
               OrtEnv *env = NULL; OrtSessionOptions *so = NULL; OrtSession *s = NULL;
+              const ORTCHAR_T *model_path;
+              if (argc < 2) return 2;
+          #ifdef _WIN32
+              /* CreateSession takes ORTCHAR_T, i.e. wchar_t on Windows: handing it
+                 the char* argv is a hard error in C++ and a garbage path in C. */
+              {
+                  wchar_t wpath[4096];
+                  int i;
+                  for (i = 0; i < 4095 && argv[1][i] != '\0'; ++i)
+                      wpath[i] = (wchar_t)(unsigned char)argv[1][i];
+                  wpath[i] = L'\0';
+                  model_path = wpath;
+              }
+          #else
+              model_path = argv[1];
+          #endif
               if (api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "smoke", &env) != NULL) return 2;
               if (api->CreateSessionOptions(&so) != NULL) return 2;
-              OrtStatus *st = api->CreateSession(env, argv[1], so, &s);
+              OrtStatus *st = api->CreateSession(env, model_path, so, &s);
               if (st != NULL) {
                   fprintf(stderr, "FAIL %s: %s\n", argv[1], api->GetErrorMessage(st));
                   return 1;
@@ -305,10 +390,23 @@ jobs:
             MINGW*|MSYS*|CYGWIN*)
               # MSVC tools are native Windows binaries: hand them Windows paths
               # (cygpath -m keeps the forward slashes bash needs on the way in).
+              # Argument conversion is off because '/' options look like POSIX
+              # paths to the MSYS2 runtime and arrive at cl as
+              # "<msys root>/nologo" -- everything below is already a Windows
+              # path, so there is nothing left for the runtime to translate.
+              # /MD matches how ORT's static library was built (CMake default is
+              # the DLL runtime): bare cl defaults to /MT and then every ucrtbase
+              # import in the archive shows up as __imp_* unresolved.
+              # /Tp<file> (not /TP) compiles just the probe as C++ so the C++
+              # runtime is linked too: /TP marks *every* command line file as a
+              # source file, so cl tries to compile onnxruntime.lib as C++ and
+              # dies with C2018 on the archive's binary header.
               w() { cygpath -m "$1"; }
-              cl /nologo /O2 "/I$(w "$root/include")" "$(w "$work/probe.c")" \
-                 "/Fe:$(w "$work/probe.exe")" "$(w "$ort_lib")" advapi32.lib shell32.lib \
-                 || { echo "::error::failed to link the probe against $ort_lib"; exit 1; }
+              MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+                cl /nologo /MD /O2 "/I$(w "$root/include")" \
+                   "/Tp$(w "$work/probe.c")" "/Fe:$(w "$work/probe.exe")" \
+                   "$(w "$ort_lib")" advapi32.lib shell32.lib ole32.lib user32.lib \
+                || { echo "::error::failed to link the probe against $ort_lib"; exit 1; }
               probe="$work/probe.exe"
               ;;
             Darwin*)
@@ -328,6 +426,11 @@ jobs:
               probe="$work/probe"
               ;;
           esac
+
+          if [ "$run_probe" -eq 0 ]; then
+            echo "windows-arm64: linked $probe against $ort_lib (not executed)"
+            exit 0
+          fi
 
           fail=0
           for m in $DEEPDOC_MODELS; do

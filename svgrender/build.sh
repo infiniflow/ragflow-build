@@ -3,12 +3,16 @@
 # Build and package the standalone resvg C-API static library (libsvgrender.a)
 # using unmodified upstream resvg (Apache-2.0 OR MIT).
 #
-# Windows is built for the `x86_64-pc-windows-gnu` target on purpose: the
-# archive is consumed by the Go sidecar's cgo link, which is MinGW-w64 based
-# (the same toolchain that links libvisio), so an MSVC staticlib would not be
-# linkable next to it. That needs a MinGW-w64 gcc on PATH (MSYS2 MINGW64 shell),
-# not MSVC. windows-arm64 is not supported: there is no aarch64-w64-mingw32
-# toolchain to pair with the cgo link.
+# Windows amd64 is built for `x86_64-pc-windows-gnu` on purpose: the archive is
+# consumed by the Go sidecar's cgo link, which is MinGW-w64 based (msvcrt, the
+# same toolchain that links libvisio), so an MSVC staticlib would not be linkable
+# next to it. That needs a MinGW-w64 gcc on PATH (MSYS2 MINGW64 shell), not MSVC.
+#
+# windows-arm64 is built for `aarch64-pc-windows-gnullvm`: there is no
+# aarch64-w64-mingw32 gcc, and gnullvm is the LLVM/UCRT variant that Go's
+# windows/arm64 cgo toolchain (llvm-mingw) links against. rustc writes a
+# staticlib without invoking a linker, so the compiler is only needed by the
+# smoke test that links a probe against the archive.
 #
 # Bash 3.2 compatible (macOS default bash) and Windows/Git Bash compatible.
 # -----------------------------------------------------------------------------
@@ -28,7 +32,7 @@ Usage: svgrender/build.sh [options]
 
 Options:
   --target <name>     Target triple: linux-amd64, linux-arm64, darwin-amd64,
-                      darwin-arm64, windows-amd64
+                      darwin-arm64, windows-amd64, windows-arm64
   --version <ver>     Release version tag (default: svgrender/SVGRENDER_VERSION, e.g. v0.45.1)
   --dist-dir <path>   Output directory for release archive (default: svgrender/dist)
   -h, --help          Show this help
@@ -88,9 +92,9 @@ case "$TARGET" in
         ARCHIVE_EXT="zip"
         ;;
     windows-arm64)
-        die "windows-arm64 is not supported: the Go sidecar links with MinGW-w64 and
-       there is no aarch64-w64-mingw32 toolchain to build this archive with.
-       Build windows-amd64 instead."
+        TARGET_OS="windows"; TARGET_ARCH="arm64"
+        RUST_TARGET="aarch64-pc-windows-gnullvm"
+        ARCHIVE_EXT="zip"
         ;;
     *) die "unsupported target: $TARGET" ;;
 esac
@@ -100,9 +104,22 @@ preflight_windows() {
 
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) ;;
-        *) die "windows-amd64 must be built on Windows from a MinGW-w64 shell
-       (MSYS2 MINGW64, or Git Bash with the mingw64 gcc on PATH)" ;;
+        *) die "windows-${TARGET_ARCH} must be built on Windows
+      (MSYS2 MINGW64, or Git Bash with the mingw64 toolchain on PATH)" ;;
     esac
+
+    if command -v rustup >/dev/null 2>&1; then
+        if ! rustup target list --installed 2>/dev/null | grep -qx "$RUST_TARGET"; then
+            die "rust target $RUST_TARGET is not installed; run 'rustup target add $RUST_TARGET'"
+        fi
+    fi
+
+    # arm64 is cross-compiled and rustc archives a staticlib without invoking a
+    # linker, so no compiler is required to produce it; the smoke test is what
+    # needs an aarch64-w64-mingw32 one.
+    if [ "$TARGET_ARCH" = "arm64" ]; then
+        return 0
+    fi
 
     local cc="" candidate machine
     for candidate in x86_64-w64-mingw32-gcc gcc; do
@@ -113,7 +130,7 @@ preflight_windows() {
     case "$machine" in
         *mingw*) ;;
         *) die "$cc is not a MinGW-w64 compiler ($machine); rustc needs
-       x86_64-w64-mingw32-gcc to link a windows-gnu staticlib" ;;
+      x86_64-w64-mingw32-gcc to link a windows-gnu staticlib" ;;
     esac
 
     # The Go sidecar links the msvcrt-based MinGW64 runtime; a UCRT build would
@@ -124,12 +141,6 @@ preflight_windows() {
             echo "         msvcrt-based MinGW64 runtime; run this from the MINGW64 environment." >&2
             ;;
     esac
-
-    if command -v rustup >/dev/null 2>&1; then
-        if ! rustup target list --installed 2>/dev/null | grep -qx "$RUST_TARGET"; then
-            die "rust target $RUST_TARGET is not installed; run 'rustup target add $RUST_TARGET'"
-        fi
-    fi
 }
 
 preflight_windows
@@ -223,9 +234,13 @@ rustc=$(rustc --version)
 EOF
 
 if [ "$TARGET_OS" = "windows" ]; then
-    cat >> "${STAGE}/BUILD_INFO.txt" << EOF
-toolchain=$(gcc -dumpmachine 2>/dev/null || echo unknown) / MinGW-w64, msvcrt runtime
-EOF
+    if [ "$TARGET_ARCH" = "arm64" ]; then
+        printf 'runtime=UCRT (LLVM gnullvm; the final link needs an aarch64-w64-mingw32 toolchain)\n' \
+            >> "${STAGE}/BUILD_INFO.txt"
+    else
+        printf 'toolchain=%s / msvcrt runtime\n' "$(gcc -dumpmachine 2>/dev/null || echo unknown)" \
+            >> "${STAGE}/BUILD_INFO.txt"
+    fi
 fi
 
 ARCHIVE_NAME="svgrender-${VERSION}-${TARGET}.${ARCHIVE_EXT}"

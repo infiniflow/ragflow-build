@@ -32,6 +32,9 @@ permissions:
 
 env:
   PKG_DIR: svgrender
+  # llvm-mingw is the only aarch64-w64-mingw32 toolchain available on an x64
+  # host; it is pinned so the arm64 leg does not drift with upstream releases.
+  LLVM_MINGW_VERSION: '20261117'
   # target -> runner, the single source of truth for the build matrix. The
   # `targets` input of a manual run narrows it (comma separated), so a single
   # platform can be rebuilt and appended to the already published release
@@ -39,13 +42,18 @@ env:
   #   linux-amd64  : ubuntu-22.04 pins glibc 2.35 for the consumers.
   #   windows-amd64: MinGW-w64 / msvcrt staticlib, built for
   #                  x86_64-pc-windows-gnu (the Go sidecar's cgo toolchain).
+  #   windows-arm64: LLVM/UCRT staticlib for aarch64-pc-windows-gnullvm. Cross
+  #                  compiled on the same x64 runner (rustc archives a staticlib
+  #                  without a linker); llvm-mingw is only needed to link the
+  #                  smoke probe, which is not executed.
   TARGET_MATRIX: |
     [
       {"target": "linux-amd64", "os": "ubuntu-22.04"},
       {"target": "linux-arm64", "os": "ubuntu-24.04-arm"},
       {"target": "darwin-arm64", "os": "macos-latest"},
       {"target": "darwin-amd64", "os": "macos-15-intel"},
-      {"target": "windows-amd64", "os": "windows-latest"}
+      {"target": "windows-amd64", "os": "windows-latest"},
+      {"target": "windows-arm64", "os": "windows-latest"}
     ]
 
 jobs:
@@ -142,22 +150,27 @@ jobs:
           update: false
           cache: false
 
-      - name: Install MinGW-w64 (windows, MSYS2)
+      - name: Install MinGW-w64 / zip (windows, MSYS2)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           set -euo pipefail
           pacman -Sy --noconfirm
-          pacman -S --needed --noconfirm mingw-w64-x86_64-gcc zip
-          # Assert on the installed file: the steps below are handed this very
-          # directory, so a base without the package must fail here.
-          test -x /mingw64/bin/gcc.exe || {
-            echo "::error::mingw-w64-x86_64-gcc is not installed under /mingw64"
-            pacman -Q | head -20
-            exit 1
-          }
-          gcc --version | head -1
-          gcc -dumpmachine
+          pacman -S --needed --noconfirm zip
+          # windows-arm64 is cross-compiled and needs no MSYS2 compiler, only
+          # Info-ZIP zip for packaging.
+          if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+            pacman -S --needed --noconfirm mingw-w64-x86_64-gcc
+            # Assert on the installed file: the steps below are handed this very
+            # directory, so a base without the package must fail here.
+            test -x /mingw64/bin/gcc.exe || {
+              echo "::error::mingw-w64-x86_64-gcc is not installed under /mingw64"
+              pacman -Q | head -20
+              exit 1
+            }
+            gcc --version | head -1
+            gcc -dumpmachine
+          fi
           # Hand the Git Bash steps the root this shell actually runs in
           # instead of letting them assume C:\msys64: mingw64/bin supplies gcc
           # for rustc, usr/bin supplies the Info-ZIP `zip` used for packaging.
@@ -167,32 +180,64 @@ jobs:
         if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup Rust toolchain (windows-gnu target)
+      - name: Setup Rust toolchain (windows target)
         if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: ${{ matrix.target == 'windows-arm64' && 'aarch64-pc-windows-gnullvm' || 'x86_64-pc-windows-gnu' }}
+
+      # Cross toolchain for the arm64 archive. rustc writes the staticlib itself
+      # and needs no linker, but the smoke probe is C and has to be linked for
+      # aarch64-w64-mingw32; llvm-mingw is the only toolchain that can do that
+      # from an x64 host (it bundles the UCRT sysroot).
+      - name: Setup llvm-mingw (windows-arm64)
+        if: matrix.target == 'windows-arm64'
+        shell: bash
+        env:
+          LLVM_MINGW_VERSION: ${{ env.LLVM_MINGW_VERSION }}
+        run: |
+          set -euo pipefail
+          zip_name="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-x86_64.zip"
+          work="$RUNNER_TEMP/llvm-mingw"
+          mkdir -p "$work"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$work/$zip_name" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${zip_name}"
+          unzip -q "$work/$zip_name" -d "$work"
+          bin="$(find "$work" -maxdepth 2 -type d -name bin -print -quit)"
+          [ -n "$bin" ] || { echo "::error::llvm-mingw unpacked without bin/"; exit 1; }
+          test -x "$bin/aarch64-w64-mingw32-clang.exe" || {
+            echo "::error::llvm-mingw ships no aarch64-w64-mingw32-clang"
+            ls "$bin" | head -20
+            exit 1
+          }
+          "$bin/aarch64-w64-mingw32-clang.exe" --version | head -1
+          printf 'LLVM_MINGW_BIN=%s\n' "$(cygpath -w "$bin")" >> "$GITHUB_ENV"
+          printf '%s\n' "$(cygpath -w "$bin")" >> "$GITHUB_PATH"
 
       - name: Build ${{ matrix.target }}
         shell: bash
         run: |
           set -euo pipefail
           if [ "${{ runner.os }}" = "Windows" ]; then
-            # rustc links a windows-gnu staticlib with the MinGW-w64 gcc, and
-            # packaging wants Info-ZIP `zip`; both live under the MSYS2 root
+            # Packaging wants Info-ZIP `zip`, which lives under the MSYS2 root
             # the install step exported. `usr/bin` is appended, not prepended:
             # it only has to supply what Git Bash lacks, never shadow it.
             # Assert outside the substitution: `:?` inside `$(...)` only kills
             # the subshell and lets an empty value through.
             : "${MSYS2_ROOT:?the MSYS2 install step exported no MSYS2_ROOT}"
             msys_root="$(cygpath -u "$MSYS2_ROOT")"
-            test -x "$msys_root/mingw64/bin/gcc.exe" || {
-              echo "::error::no gcc under $MSYS2_ROOT\\mingw64\\bin"
-              ls "$msys_root" 2>/dev/null | head -20 || true
-              exit 1
-            }
-            export PATH="$msys_root/mingw64/bin:$PATH:$msys_root/usr/bin"
-            gcc -dumpmachine
+            export PATH="$PATH:$msys_root/usr/bin"
+            if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+              # rustc links a windows-gnu staticlib with the MinGW-w64 gcc.
+              test -x "$msys_root/mingw64/bin/gcc.exe" || {
+                echo "::error::no gcc under $MSYS2_ROOT\\mingw64\\bin"
+                ls "$msys_root" 2>/dev/null | head -20 || true
+                exit 1
+              }
+              export PATH="$msys_root/mingw64/bin:$PATH"
+              gcc -dumpmachine
+            fi
             command -v zip || echo "::warning::no Info-ZIP zip; packaging falls back to bsdtar"
           fi
           bash "${{ env.PKG_DIR }}/build.sh" \
@@ -204,12 +249,22 @@ jobs:
         run: |
           set -euo pipefail
           cc_bin=cc
+          run_probe=1
           if [ "${{ runner.os }}" = "Windows" ]; then
             # The same MinGW-w64 gcc the build linked with. `cc` is not what
             # Git Bash provides, so the compiler is named explicitly.
             : "${MSYS2_ROOT:?the MSYS2 install step exported no MSYS2_ROOT}"
             export PATH="$(cygpath -u "$MSYS2_ROOT")/mingw64/bin:$PATH"
             cc_bin=gcc
+          fi
+          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+            # llvm-mingw's driver names the triple and carries its own UCRT
+            # sysroot. An x64 runner cannot execute an arm64 binary, so this leg
+            # only proves that the packaged archive links.
+            : "${LLVM_MINGW_BIN:?the llvm-mingw step exported no LLVM_MINGW_BIN}"
+            export PATH="$(cygpath -u "$LLVM_MINGW_BIN"):$PATH"
+            cc_bin=aarch64-w64-mingw32-clang
+            run_probe=0
           fi
           # One glob per platform: `ls a/*.tar.gz b/*.zip` fails with status 2
           # whenever the second pattern matches nothing, and -o pipefail turns
@@ -277,7 +332,11 @@ jobs:
             libs="-lm -lws2_32 -luserenv -lbcrypt -lntdll -lole32 -lshell32 -ladvapi32 -lsynchronization"
           fi
           "$cc_bin" -o "$probe" "$work/probe.c" -I"$work/include" "$work/lib/libsvgrender.a" $libs
-          "$probe"
+          if [ "$run_probe" -eq 1 ]; then
+            "$probe"
+          else
+            echo "windows-arm64: linked $probe against libsvgrender.a (not executed)"
+          fi
 
       - name: Portability gate (nm) — linux-amd64
         if: matrix.target == 'linux-amd64'

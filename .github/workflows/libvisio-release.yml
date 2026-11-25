@@ -32,19 +32,27 @@ permissions:
 
 env:
   PKG_DIR: libvisio
+  # llvm-mingw is the only aarch64-w64-mingw32 toolchain that runs on an x64
+  # host; pinned so the arm64 leg does not drift with upstream releases.
+  LLVM_MINGW_VERSION: '20261117'
   # target -> runner, the single source of truth for the build matrix. The
   # `targets` input of a manual run narrows it (comma separated), so a single
   # platform can be rebuilt and appended to the already published release
   # without touching the archives that are already there.
   #   linux-amd64  : ubuntu-22.04 pins glibc 2.35 / GCC 11.4 for the consumers.
   #   windows-amd64: MSYS2 MINGW64 (msvcrt) autotools build, ships MinGW .a.
+  #   windows-arm64: the same autotools sources cross-compiled from the same x64
+  #                  runner with llvm-mingw (UCRT), aarch64 zlib/boost from
+  #                  MSYS2's CLANGARM64 prefix. The smoke probe links but does not
+  #                  run: an x64 runner cannot execute an arm64 binary.
   TARGET_MATRIX: |
     [
       {"target": "linux-amd64", "os": "ubuntu-22.04"},
       {"target": "linux-arm64", "os": "ubuntu-24.04-arm"},
       {"target": "darwin-arm64", "os": "macos-latest"},
       {"target": "darwin-amd64", "os": "macos-15-intel"},
-      {"target": "windows-amd64", "os": "windows-latest"}
+      {"target": "windows-amd64", "os": "windows-latest"},
+      {"target": "windows-arm64", "os": "windows-latest"}
     ]
 
 jobs:
@@ -149,8 +157,10 @@ jobs:
           update: false
           cache: false
 
-      - name: Install build deps (windows, MSYS2)
-        if: runner.os == 'Windows'
+      - name: Install build deps (windows-amd64, MSYS2)
+        # windows-arm64 installs its own cross set below; the x64 toolchain and
+        # the x64 boost/zlib would be dead weight on that leg.
+        if: matrix.target == 'windows-amd64'
         shell: msys2 {0}
         run: |
           set -euo pipefail
@@ -191,8 +201,78 @@ jobs:
             --target 'windows-amd64' \
             --version '${{ needs.prepare.outputs.version }}'
 
+      # Cross toolchain for windows-arm64. llvm-mingw bundles the aarch64 UCRT
+      # sysroot and runs on an x64 host; the path is exported because the MSYS2
+      # shells below do not reliably inherit the job PATH.
+      - name: Setup llvm-mingw (windows-arm64)
+        if: matrix.target == 'windows-arm64'
+        shell: bash
+        env:
+          LLVM_MINGW_VERSION: ${{ env.LLVM_MINGW_VERSION }}
+        run: |
+          set -euo pipefail
+          zip_name="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-x86_64.zip"
+          work="$RUNNER_TEMP/llvm-mingw"
+          mkdir -p "$work"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$work/$zip_name" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${zip_name}"
+          unzip -q "$work/$zip_name" -d "$work"
+          bin="$(find "$work" -maxdepth 2 -type d -name bin -print -quit)"
+          [ -n "$bin" ] || { echo "::error::llvm-mingw unpacked without bin/"; exit 1; }
+          test -x "$bin/aarch64-w64-mingw32-clang.exe" || {
+            echo "::error::llvm-mingw ships no aarch64-w64-mingw32-clang"
+            ls "$bin" | head -20
+            exit 1
+          }
+          "$bin/aarch64-w64-mingw32-clang.exe" --version | head -1
+          printf 'LLVM_MINGW_BIN=%s\n' "$(cygpath -w "$bin")" >> "$GITHUB_ENV"
+          printf '%s\n' "$(cygpath -w "$bin")" >> "$GITHUB_PATH"
+
+      # zlib and boost are the only target libraries the autotools build links
+      # against. CLANGARM64 packages are aarch64 data (headers + .a), never
+      # executed here, so they can be installed next to the MINGW64 toolchain.
+      - name: Install arm64 target libs (windows-arm64, MSYS2)
+        if: matrix.target == 'windows-arm64'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm
+          pacman -S --needed --noconfirm \
+            mingw-w64-clang-aarch64-zlib \
+            mingw-w64-clang-aarch64-boost \
+            make pkgconf m4 zip unzip
+          test -f /clangarm64/lib/libz.a || {
+            echo "::error::no aarch64 zlib under /clangarm64"
+            exit 1
+          }
+          test -d /clangarm64/include/boost || {
+            echo "::error::no aarch64 boost headers under /clangarm64"
+            exit 1
+          }
+          printf 'ARM64_PREFIX=%s\n' /clangarm64 >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.target }} (windows-arm64, MSYS2)
+        if: matrix.target == 'windows-arm64'
+        # Same autotools build as the amd64 leg, cross-compiled: build.sh's
+        # setup_windows_arm64() exports the llvm-mingw tools, --host and the
+        # CLANGARM64 include/lib paths, so only the toolchain PATH is set here.
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          : "${LLVM_MINGW_BIN:?the llvm-mingw step exported no LLVM_MINGW_BIN}"
+          export PATH="$(cygpath -u "$LLVM_MINGW_BIN"):$PATH"
+          command -v aarch64-w64-mingw32-clang || {
+            echo "::error::aarch64-w64-mingw32-clang is not on PATH"
+            echo "PATH=$PATH"
+            exit 1
+          }
+          bash "${{ env.PKG_DIR }}/build.sh" \
+            --target 'windows-arm64' \
+            --version '${{ needs.prepare.outputs.version }}'
+
       - name: Build ${{ matrix.target }} (posix)
-        if: matrix.target != 'windows-amd64'
+        if: ${{ !startsWith(matrix.target, 'windows') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -221,12 +301,38 @@ jobs:
             *)      tar -xzf "$archive" -C "$work" ;;
           esac
 
+          # Tool selection first: the archiver/inspector must understand the
+          # archive. MSYS2's x64 binutils cannot read an aarch64 one, so the arm64
+          # leg uses llvm-mingw's triple-prefixed tools. libxml2 is configured
+          # --without-zlib, but librevenge-stream's RVNGZipStream inflates the zip
+          # parts embedded in a vsdx/vsdm, so zlib is required on every platform.
+          bin_prefix=""
+          cxx="c++"
+          libs="-lz"
+          probe="$work/probe"
+          run_probe=1
+          case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*)
+              probe="$work/probe.exe"
+              if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+                # An x64 runner cannot execute an arm64 binary, so this leg only
+                # links. -L points at the aarch64 zlib the build compiled against.
+                bin_prefix="aarch64-w64-mingw32-"
+                cxx="${bin_prefix}clang++"
+                libs="-lz -static -L${ARM64_PREFIX:-/clangarm64}/lib"
+                run_probe=0
+              else
+                libs="-lz -static-libgcc -static-libstdc++"
+              fi
+              ;;
+          esac
+
           # Verify no nested archive members in libvisio-0.1.a and no real ICU ucnv_* refs.
-          if ar t "$work/lib/libvisio-0.1.a" | grep -q '\.a$'; then
+          if "${bin_prefix}ar" t "$work/lib/libvisio-0.1.a" | grep -q '\.a$'; then
             echo "::error::unexpected non-object member inside libvisio-0.1.a"
             exit 1
           fi
-          if nm -u "$work/lib/libvisio-0.1.a" | grep -E 'ucnv_' | grep -vq 'visio_ucnv_'; then
+          if "${bin_prefix}nm" -u "$work/lib/libvisio-0.1.a" | grep -E 'ucnv_' | grep -vq 'visio_ucnv_'; then
             echo "::error::unexpected unshimmed ICU ucnv_* reference in libvisio-0.1.a"
             exit 1
           fi
@@ -251,20 +357,7 @@ jobs:
           }
           EOF
 
-          # libxml2 itself is configured --without-zlib, but librevenge-stream's
-          # RVNGZipStream inflates the zip parts embedded in a vsdx/vsdm, so
-          # zlib is required on every platform. Windows additionally keeps the
-          # C++ runtime static.
-          libs="-lz"
-          probe="$work/probe"
-          case "$(uname -s)" in
-            MINGW*|MSYS*|CYGWIN*)
-              libs="-lz -static-libgcc -static-libstdc++"
-              probe="$work/probe.exe"
-              ;;
-          esac
-
-          c++ -std=c++17 -o "$probe" "$work/probe.cc" \
+          "$cxx" -std=c++17 -o "$probe" "$work/probe.cc" \
             -I"$work/include/libvisio-0.1" -I"$work/include/librevenge-0.0" \
             "$work/lib/libvisio-0.1.a" \
             "$work/lib/librevenge-generators-0.0.a" \
@@ -272,17 +365,27 @@ jobs:
             "$work/lib/librevenge-0.0.a" \
             "$work/lib/libxml2.a" \
             $libs
-          "$probe"
-          echo "OK: probe linked and ran cleanly on ${{ matrix.target }}"
+          if [ "$run_probe" -eq 1 ]; then
+            "$probe"
+            echo "OK: probe linked and ran cleanly on ${{ matrix.target }}"
+          else
+            echo "OK: windows-arm64 probe linked against the packaged archives (not executed)"
+          fi
           SMOKE
 
       - name: Smoke test (windows, MSYS2)
-        if: matrix.target == 'windows-amd64'
+        if: startsWith(matrix.target, 'windows')
         shell: msys2 {0}
-        run: bash "$(cygpath -u "$RUNNER_TEMP")/smoke.sh"
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+            : "${LLVM_MINGW_BIN:?the llvm-mingw step exported no LLVM_MINGW_BIN}"
+            export PATH="$(cygpath -u "$LLVM_MINGW_BIN"):$PATH"
+          fi
+          bash "$(cygpath -u "$RUNNER_TEMP")/smoke.sh"
 
       - name: Smoke test (posix)
-        if: matrix.target != 'windows-amd64'
+        if: ${{ !startsWith(matrix.target, 'windows') }}
         shell: bash
         run: bash "$RUNNER_TEMP/smoke.sh"
 

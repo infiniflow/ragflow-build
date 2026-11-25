@@ -52,8 +52,24 @@ would mix two C runtimes into one binary). The archive contents match the other
 platforms — `lib/libvisio-0.1.a`, `librevenge-*.a`, `libxml2.a` — and
 `-fPIC` is dropped because MinGW-w64 has no PIC distinction.
 
-`windows-arm64` is not supported: MSYS2 has no `aarch64-w64-mingw32` gcc for an
-autotools build.
+`windows-arm64` is cross-compiled on the same x64 host with **llvm-mingw**
+(UCRT, the toolchain Go's `windows/arm64` cgo link uses), because MSYS2 has no
+`aarch64-w64-mingw32` gcc for an autotools build. The aarch64 zlib and boost come
+from the **CLANGARM64** prefix:
+
+```bash
+# llvm-mingw: https://github.com/mstorsjo/llvm-mingw/releases
+#   llvm-mingw-<ver>-ucrt-x86_64.zip -- put its bin/ on PATH
+pacman -S mingw-w64-clang-aarch64-zlib mingw-w64-clang-aarch64-boost \
+          make pkgconf m4 zip
+bash libvisio/build.sh --target windows-arm64
+```
+
+The script refuses to run without the cross tools, `/clangarm64/lib/libz.a` or
+the boost headers, exports `CC`/`AR`/`WINDRES` plus `--host=aarch64-w64-mingw32`,
+and points pkg-config at `PKG_CONFIG_LIBDIR=<install>/lib/pkgconfig:/clangarm64`
+so no x64 `.pc` file can leak into the target build. Results cannot be executed
+on an x64 runner; the smoke probe only links.
 
 ## Releasing
 
@@ -62,4 +78,4 @@ git tag libvisio-v0.1.10 && git push origin libvisio-v0.1.10
 ```
 
 Or run `.github/workflows/libvisio-release.yml` via **Actions → Run workflow**
-(`dry_run=true` builds and smoke-tests all 4 targets without publishing).
+(`dry_run=true` builds and smoke-tests all 6 targets without publishing).

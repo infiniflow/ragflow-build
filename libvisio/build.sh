@@ -20,6 +20,11 @@
 # toolchain. Run it from an MSYS2 MINGW64 shell (pacman -S
 # mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost make pkgconf zip).
 #
+# windows-arm64 is cross-compiled from the same x64 host with llvm-mingw
+# (LLVM/UCRT, the toolchain Go's windows/arm64 cgo link uses): there is no
+# aarch64-w64-mingw32 gcc. Target libraries (zlib, boost headers) come from
+# MSYS2's CLANGARM64 prefix. See setup_windows_arm64().
+#
 # Bash 3.2 compatible (macOS default bash) and Windows/Git Bash compatible.
 # -----------------------------------------------------------------------------
 set -euo pipefail
@@ -51,7 +56,7 @@ Usage: libvisio/build.sh [options]
 
 Options:
   --target <name>     Target triple: linux-amd64, linux-arm64, darwin-amd64,
-                      darwin-arm64, windows-amd64
+                      darwin-arm64, windows-amd64, windows-arm64
   --version <ver>     libvisio version tag (default: libvisio/LIBVISIO_VERSION, e.g. v0.1.10)
   --dist-dir <path>   Output directory for release archive (default: libvisio/dist)
   --jobs <n>, -j <n>  Parallel make jobs
@@ -99,6 +104,9 @@ detect_host_target() {
 # archives already published for linux/darwin are rebuilt from the same recipe.
 PIC_FLAG="-fPIC"
 ARCHIVE_EXT="tar.gz"
+CROSS_TRIPLE=""
+CONFIGURE_HOST=()
+CONFIGURE_BOOST=()
 case "$TARGET" in
     linux-amd64)  TARGET_OS="linux";  TARGET_ARCH="amd64" ;;
     linux-arm64)  TARGET_OS="linux";  TARGET_ARCH="arm64" ;;
@@ -110,9 +118,12 @@ case "$TARGET" in
         ARCHIVE_EXT="zip"
         ;;
     windows-arm64)
-        die "windows-arm64 is not supported: MSYS2 has no aarch64-w64-mingw32 gcc for
-       an autotools build, and the Go sidecar's cgo link needs that toolchain.
-       Build windows-amd64 instead."
+        TARGET_OS="windows"; TARGET_ARCH="arm64"
+        PIC_FLAG=""
+        ARCHIVE_EXT="zip"
+        # No aarch64-w64-mingw32 gcc exists: llvm-mingw provides the cross
+        # compiler, and Go's windows/arm64 cgo link uses the same toolchain.
+        CROSS_TRIPLE="aarch64-w64-mingw32"
         ;;
     *) echo "error: unsupported target: $TARGET" >&2; exit 1 ;;
 esac
@@ -185,6 +196,10 @@ pack_archive() {
 # runtime (msvcrt) as Go's cgo link.
 preflight_windows() {
     [ "$TARGET_OS" = "windows" ] || return 0
+    # windows-arm64 is cross-compiled; setup_windows_arm64 checks its own tools.
+    if [ "$TARGET_ARCH" = "arm64" ]; then
+        return 0
+    fi
 
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) ;;
@@ -221,6 +236,63 @@ preflight_windows() {
     esac
 }
 
+# MSYS2's CLANGARM64 prefix holds the aarch64 libraries this cross build needs
+# (zlib, boost headers). It is reachable as /clangarm64 from any MSYS2 shell of
+# the same installation.
+ARM64_PREFIX="${ARM64_PREFIX:-/clangarm64}"
+
+setup_windows_arm64() {
+    [ "$TARGET_OS" = "windows" ] || return 0
+    [ "$TARGET_ARCH" = "arm64" ] || return 0
+
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *) die "windows-arm64 is cross-compiled from Windows, run this in an MSYS2 shell" ;;
+    esac
+
+    local tool
+    for tool in "${CROSS_TRIPLE}-clang" "${CROSS_TRIPLE}-clang++" \
+                "${CROSS_TRIPLE}-ar" "${CROSS_TRIPLE}-ranlib" \
+                "${CROSS_TRIPLE}-windres" make m4 pkg-config; do
+        command -v "$tool" >/dev/null 2>&1 \
+            || die "missing $tool: put llvm-mingw's bin on PATH
+       (https://github.com/mstorsjo/llvm-mingw, the ucrt-x86_64 archive: it runs
+       on an x64 host and targets aarch64-w64-mingw32)"
+    done
+
+    { [ -f "${ARM64_PREFIX}/include/zlib.h" ] && [ -f "${ARM64_PREFIX}/lib/libz.a" ]; } \
+        || die "${ARM64_PREFIX} carries no aarch64 zlib
+      (MSYS2: pacman -S mingw-w64-clang-aarch64-zlib, or set ARM64_PREFIX)"
+    [ -d "${ARM64_PREFIX}/include/boost" ] \
+        || die "${ARM64_PREFIX} carries no boost headers
+      (MSYS2: pacman -S mingw-w64-clang-aarch64-boost, or set ARM64_PREFIX)"
+
+    export CC="${CROSS_TRIPLE}-clang"
+    export CXX="${CROSS_TRIPLE}-clang++"
+    export AR="${CROSS_TRIPLE}-ar"
+    export RANLIB="${CROSS_TRIPLE}-ranlib"
+    export NM="${CROSS_TRIPLE}-nm"
+    export STRIP="${CROSS_TRIPLE}-strip"
+    export WINDRES="${CROSS_TRIPLE}-windres"
+    export DLLTOOL="${CROSS_TRIPLE}-dlltool"
+    export LDFLAGS="-L${ARM64_PREFIX}/lib"
+    # pkg-config must see the target .pc files only, never the x64 ones of the
+    # MINGW64 prefix: that is the prefix the autotools builds install into plus
+    # CLANGARM64, which carries zlib.pc for aarch64. Both paths are MSYS-style,
+    # so the ':' separator is unambiguous.
+    export PKG_CONFIG_LIBDIR="${PREFIX}/lib/pkgconfig:${ARM64_PREFIX}/lib/pkgconfig"
+    # librevenge's zlib check is PKG_CHECK_MODULES(zlib), i.e. a pkg-config
+    # lookup; state the answer directly as well so a missing .pc cannot abort
+    # the cross build.
+    export ZLIB_CFLAGS="-I${ARM64_PREFIX}/include"
+    export ZLIB_LIBS="-L${ARM64_PREFIX}/lib -lz"
+    CONFIGURE_HOST=(--build=x86_64-w64-mingw32 --host="${CROSS_TRIPLE}")
+    # AX_BOOST_BASE looks for boost on its own; point it at the cross prefix
+    # instead of relying on it honouring CPPFLAGS.
+    CONFIGURE_BOOST=(--with-boost="${ARM64_PREFIX}")
+    EXTRA_INC="-I${ARM64_PREFIX}/include ${EXTRA_INC}"
+}
+
 preflight_windows
 
 VISIO_URL="https://dev-www.libreoffice.org/src/libvisio/libvisio-${BARE_VERSION}.tar.xz"
@@ -246,6 +318,10 @@ elif [ "$TARGET_OS" = "darwin" ] && command -v brew >/dev/null 2>&1; then
     fi
 fi
 
+# Cross tools, --host and the aarch64 include path; a no-op for every other
+# target. Runs after EXTRA_INC so it can prepend the arm64 prefix.
+setup_windows_arm64
+
 echo "==> Downloading unmodified libxml2 ${LIBXML2_VERSION}, librevenge ${REVENGE_VERSION}, libvisio ${BARE_VERSION}"
 curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 -o "${WORK}/libxml2.tar.xz" "$LIBXML2_URL"
 verify_sha256 "${WORK}/libxml2.tar.xz" "$LIBXML2_SHA256"
@@ -267,6 +343,7 @@ echo "==> Building static libxml2 ${LIBXML2_VERSION} (unmodified)"
     cd "${WORK}/libxml2-${LIBXML2_VERSION}"
     ./configure \
         --prefix="$PREFIX" \
+        ${CONFIGURE_HOST[@]+"${CONFIGURE_HOST[@]}"} \
         --enable-static --disable-shared \
         --without-python --without-lzma --without-icu \
         --without-http --without-ftp --without-catalog \
@@ -282,6 +359,8 @@ echo "==> Building static librevenge ${REVENGE_VERSION} (unmodified)"
     cd "${WORK}/librevenge-${REVENGE_VERSION}"
     ./configure \
         --prefix="$PREFIX" \
+        ${CONFIGURE_HOST[@]+"${CONFIGURE_HOST[@]}"} \
+        ${CONFIGURE_BOOST[@]+"${CONFIGURE_BOOST[@]}"} \
         --enable-static --disable-shared \
         --disable-tests --without-docs --disable-werror \
         CFLAGS="-O2 ${PIC_FLAG}" \
@@ -310,6 +389,7 @@ echo "==> Building static libvisio ${BARE_VERSION} (unmodified upstream, ICU shi
     LIBXML_CFLAGS="-I${PREFIX}/include/libxml2 -DLIBXML_STATIC" LIBXML_LIBS=" " \
     ./configure \
         --prefix="$PREFIX" \
+        ${CONFIGURE_HOST[@]+"${CONFIGURE_HOST[@]}"} \
         --enable-static --disable-shared \
         --disable-tests --without-docs --disable-tools --disable-werror \
         CFLAGS="-O2 ${PIC_FLAG}" \
@@ -353,9 +433,15 @@ icu_mode=compile-time header shim -> visio_ucnv_*
 EOF
 
 if [ "$TARGET_OS" = "windows" ]; then
-    cat >> "${STAGE}/BUILD_INFO.txt" << EOF
+    if [ "$TARGET_ARCH" = "arm64" ]; then
+        cat >> "${STAGE}/BUILD_INFO.txt" << EOF
+toolchain=$("${CROSS_TRIPLE}-clang" -dumpmachine 2>/dev/null || echo unknown) / llvm-mingw, UCRT runtime
+EOF
+    else
+        cat >> "${STAGE}/BUILD_INFO.txt" << EOF
 toolchain=$(gcc -dumpmachine 2>/dev/null || echo unknown) / MinGW-w64, msvcrt runtime
 EOF
+    fi
 fi
 
 ARCHIVE_NAME="libvisio-${VERSION}-${TARGET}.${ARCHIVE_EXT}"
