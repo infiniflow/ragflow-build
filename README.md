@@ -20,7 +20,7 @@ Each dependency owns a self-contained directory at the repository root:
 │   │   └── cross-linux-aarch64.sh   # x86_64 -> aarch64 cross build
 │   ├── build/                   # build trees (git ignored)
 │   ├── dist/                    # release artifacts (git ignored)
-│   └── onnxruntime/             # upstream git submodule (microsoft/onnxruntime)
+│   └── onnxruntime/             # upstream git submodule (gitcode.com mirror)
 ├── libvisio/                    # unmodified static libvisio + librevenge + libxml2
 │   ├── LIBVISIO_VERSION         # pinned upstream version, e.g. 0.1.10
 │   ├── build.sh                 # fetch, verify, build & package static archives
@@ -37,18 +37,82 @@ Each dependency owns a self-contained directory at the repository root:
 
 | Dependency | Pinned version | License | Targets | Release tag |
 | --- | --- | --- | --- | --- |
-| [`onnxruntime`](#onnxruntime) | `v1.29.0` (`onnxruntime/ORT_VERSION`) | MIT | `linux-x86_64`, `linux-aarch64`, `osx-arm64`, `osx-universal` | `onnxruntime-v*` / `release-v*` |
-| [`libvisio`](#libvisio) | `0.1.10` (`libvisio/LIBVISIO_VERSION`) | MPL-2.0 / MIT | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64` | `libvisio-v*` |
-| [`svgrender`](#svgrender) | `0.45.1` (`svgrender/SVGRENDER_VERSION`) | Apache-2.0 OR MIT | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64` | `svgrender-v*` |
+| [`onnxruntime`](#onnxruntime) | `v1.29.0` (`onnxruntime/ORT_VERSION`) | MIT | `linux-x86_64`, `linux-aarch64`, `osx-arm64`, `osx-universal`, `windows-x64` | `onnxruntime-v*` / `release-v*` |
+| [`libvisio`](#libvisio) | `0.1.10` (`libvisio/LIBVISIO_VERSION`) | MPL-2.0 / MIT | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64` | `libvisio-v*` |
+| [`svgrender`](#svgrender) | `0.45.1` (`svgrender/SVGRENDER_VERSION`) | Apache-2.0 OR MIT | `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64` | `svgrender-v*` |
 
 Adding another dependency later means adding one more top-level directory plus
 one more workflow file.
+
+### Windows toolchains (why the three differ)
+
+Windows support is a **new target on the existing releases**, not a new release
+line: the archives are appended to the published tag (see
+[Rebuilding one platform onto an existing release](#rebuilding-one-platform-onto-an-existing-release)).
+
+The toolchain differs per dependency because each is forced by its consumer and
+by upstream:
+
+| Dependency | Windows toolchain | Artifact | Why |
+| --- | --- | --- | --- |
+| `onnxruntime` | MSVC (`windows-latest` + `ilammy/msvc-dev-cmd`) | `lib/onnxruntime.lib` | Upstream ORT has no MinGW support at all. |
+| `libvisio` | MSYS2 **MINGW64** (msvcrt) autotools | `lib/*.a` | Upstream only ships autotools; MSVC is not an option. |
+| `svgrender` | Rust `x86_64-pc-windows-gnu` | `lib/libsvgrender.a` | Must link next to `libvisio`/Go cgo, i.e. the same MinGW-w64 runtime. |
+
+There is no `windows-arm64` for `libvisio`/`svgrender`: the Go sidecar links with
+MinGW-w64 and MSYS2 has no `aarch64-w64-mingw32` gcc for an autotools/cgo build.
+`onnxruntime` implements `windows-arm64` but leaves it out of the matrix until a
+consumer needs it.
+
+### Rebuilding one platform onto an existing release
+
+Every workflow takes a `targets` input on `workflow_dispatch`. Empty builds the
+whole matrix and publishes/replaces the release; a comma-separated list builds
+**only** those targets and **appends** them to the release that version already
+has:
+
+- archives already attached are never rebuilt or replaced;
+- `checksums.txt` is downloaded from the release, merged with the new lines and
+  re-uploaded, so it stays a complete index (a re-run corrects a digest instead
+  of duplicating an entry);
+- the release body is appended to, not rewritten, and a published release is
+  never demoted back to a draft.
+
+That is how Windows was added to tags that had already shipped:
+
+```
+Actions → <dependency> release → Run workflow
+    version:  v0.1.10            (or whatever the existing release uses)
+    targets:  windows-amd64      (svgrender / libvisio)
+              windows-x64        (onnxruntime)
+    dry_run:  false
+```
+
+The release tag is derived from the version (`svgrender-v<version>`,
+`libvisio-v<version>`, `onnxruntime-v<version>`), so a manual run of an already
+released version lands on that version's release instead of creating a new one.
+Run it once with `dry_run = true` first: every listed target builds, smoke-tests
+and uploads artifacts without publishing.
+
+> For onnxruntime pass the **release** version, including any vendor suffix:
+> `ort_version = v1.29.0-patch2` resolves the tag
+> `onnxruntime-v1.29.0-patch2`, fetches and builds upstream `v1.29.0`, and names
+> the Windows asset `onnxruntime-v1.29.0-windows-x64.zip` like every other
+> platform under that tag.
 
 ---
 
 ## onnxruntime
 
 Pinned to **v1.29.0** (see `onnxruntime/ORT_VERSION`).
+
+**The source comes from the gitcode.com mirror**, not from
+`github.com/microsoft/onnxruntime`: that repository now answers
+`Repository not found`, so the tree is fetched from
+`https://gitcode.com/gh_mirrors/on/onnxruntime.git` instead (see the repo root
+`.gitmodules`). The mirror is a faithful copy — its `v1.29.0` tag is the same
+commit this repo previously pinned. Upstream publishes shared libraries only,
+so the static libraries shipped here are built from that source in CI.
 
 ### 1. Get the sources
 
@@ -60,6 +124,11 @@ bash onnxruntime/scripts/init-submodules.sh
 
 This registers the submodule, checks out exactly the tag in `ORT_VERSION` and
 pulls the recursive build dependencies. Use `--full` for an unshallow clone.
+
+The build dependencies are not vendored in the mirror: `cmake/deps.txt` points
+at the third-party repositories (abseil, onnx, protobuf, flatbuffers, eigen,
+cpuinfo, ...), none of which live under `microsoft/onnxruntime`, so the build
+still resolves them while the upstream tree is gone.
 
 ### 2. Build
 
@@ -82,7 +151,7 @@ identical. Note that `--disable_contrib_ops` is **not** one of them, see
 
 | Option | Description |
 | --- | --- |
-| `--target <name>` | `linux-x86_64`, `linux-aarch64`, `osx-arm64`, `osx-x86_64`, `osx-universal`, `windows-x64`, `windows-arm64`. Default: detected from the host. Windows targets are implemented but not exercised in CI right now, see [Platform status](#platform-status). |
+| `--target <name>` | `linux-x86_64`, `linux-aarch64`, `osx-arm64`, `osx-x86_64`, `osx-universal`, `windows-x64`, `windows-arm64`. Default: detected from the host. `windows-x64` is built in CI; `windows-arm64` is implemented but not built, see [Platform status](#platform-status). |
 | `--build-dir <path>` | Build root. Default `onnxruntime/build/<target>`. |
 | `--dist-dir <path>` | Where the archive lands. Default `onnxruntime/dist`. |
 | `--jobs <n>`, `-j <n>` | Max parallel compile jobs. Default: one per core, capped at 4 when less than 8 GB of RAM is free. |
@@ -251,13 +320,16 @@ Runner mapping:
 | `linux-aarch64` | `ubuntu-24.04-arm` | ⏳ native arm64, not yet run |
 | `osx-arm64` | `macos-latest` | ⏳ native arm64, not yet run |
 | `osx-universal` | `macos-latest` | ⏳ two slices merged with `lipo`, not yet run |
-| `windows-x64` | `windows-latest` | ⛔ disabled, see below |
-| `windows-arm64` | `windows-latest` | ⛔ disabled, see below |
+| `windows-x64` | `windows-latest` | ✅ MSVC, in the matrix |
+| `windows-arm64` | `windows-latest` | ⛔ out of the matrix, see below |
 
 ### Platform status
 
-**Windows is disabled in CI.** The runner image has no Visual Studio instance,
-so CMake configure fails:
+**`windows-x64` builds on `windows-latest`.** The job runs
+`ilammy/msvc-dev-cmd` before anything else: it puts the MSVC toolchain (and
+`lib.exe`, which `scripts/package.sh` also locates through `vswhere.exe`) on
+`PATH`, so CMake finds the Visual Studio generator. Without that step configure
+fails with
 
 ```
 CMake Error at CMakeLists.txt:11 (project):
@@ -266,11 +338,16 @@ CMake Error at CMakeLists.txt:11 (project):
   could not find any instance of Visual Studio.
 ```
 
-`build.sh` still implements `windows-x64` and `windows-arm64` — only the matrix
-rows in the workflow are commented out. To re-enable, uncomment the two
-`windows-*` entries in `.github/workflows/onnxruntime-release.yml` (and restore
-the Windows rows in the release body table). Packaging additionally needs MSVC's
-`lib.exe`, which `scripts/package.sh` locates via `PATH` or `vswhere.exe`.
+The Windows archive ships `lib/onnxruntime.lib` instead of
+`lib/libonnxruntime.a`; the build is otherwise identical to the other targets.
+`scripts/package.sh` merges the archives with `lib.exe`, converting every path
+through `cygpath` first — MSVC tools understand neither `/c/...` nor the MSYS2
+`/tmp` mount, and MSYS2 does not translate paths inside a response file.
+
+**`windows-arm64` stays out of the matrix.** `build.sh` and `package.sh`
+implement it (add the row back to `TARGET_MATRIX` in the workflow to build it),
+but nothing consumes it yet and it needs the arm64 MSVC cross tools on the same
+x64 runner.
 
 **Shell compatibility: the scripts target bash 3.2.** macOS ships bash 3.2,
 which has no associative arrays (`declare -A`) and no `mapfile`. Everything is
@@ -367,10 +444,14 @@ git -C onnxruntime/onnxruntime ls-remote --tags origin | grep -oE 'refs/tags/v[0
   the mismatched host and falls back to `scripts/cross-linux-aarch64.sh`, which
   installs `crossbuild-essential-arm64` and cross compiles. Change `os` in the
   workflow matrix to switch.
-- **Windows generator.** The script deliberately keeps the default Visual
-  Studio generator on Windows; ninja is only auto-selected on unix where the
-  toolchain is already on `PATH`. Pass `--cmake_generator Ninja` from a
-  developer prompt to override.
+- **Windows generator.** Ninja is auto-selected whenever both `ninja` and `cl`
+  are on `PATH` (a developer prompt locally, `ilammy/msvc-dev-cmd` in CI).
+  Without `cl` the script falls back to the Visual Studio generator, which is
+  version-pinned by upstream: `tools/ci_build/build_args.py` hardcodes
+  `"Visual Studio 17 2022"` when no generator is passed, so a runner image
+  carrying only a newer VS fails configure with
+  `could not find any instance of Visual Studio`. Pass `--cmake_generator` to
+  override either choice.
 - **Reproducibility.** `build.sh` re-checks out the pinned tag whenever the
   submodule work tree is clean, so a stale checkout cannot silently end up in a
   release.
@@ -402,11 +483,13 @@ against compile-time headers in `libvisio/icu_shim/unicode/` that remap those
 ```bash
 # Ubuntu / Debian: sudo apt-get install -y libboost-dev pkg-config zlib1g-dev
 # macOS:           brew install boost pkg-config
-bash libvisio/build.sh
+# Windows (MSYS2 MINGW64 shell, not Git Bash):
+#   pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip
+bash libvisio/build.sh                 # add --target windows-amd64 for Windows
 ```
 
-Output lands in `libvisio/dist/libvisio-v<version>-<target>.tar.gz` plus a
-`.sha256` file:
+Output lands in `libvisio/dist/libvisio-v<version>-<target>.tar.gz` — a `.zip`
+for `windows-amd64` — plus a `.sha256` file:
 
 ```
 ./
@@ -429,10 +512,16 @@ Output lands in `libvisio/dist/libvisio-v<version>-<target>.tar.gz` plus a
 
 ### Releasing libvisio
 
-`.github/workflows/libvisio-release.yml` builds and smoke-tests all 4 targets
-(`linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`) — including an
-`ubuntu-22.04` glibc 2.35 portability gate — and publishes tarballs +
-`checksums.txt`.
+`.github/workflows/libvisio-release.yml` builds and smoke-tests all 5 targets
+(`linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`)
+— including an `ubuntu-22.04` glibc 2.35 portability gate — and publishes
+tarballs/zips + `checksums.txt`.
+
+The Windows job runs inside the MSYS2 MINGW64 shell (`msystem: MINGW64`), so the
+archives carry the msvcrt-based MinGW64 runtime that Go's cgo link uses. The
+archive contents are identical to the other platforms: the same
+`lib/libvisio-0.1.a`, `librevenge-*` and `libxml2.a` names, just compiled by
+MinGW-w64 instead of gcc/clang.
 
 ```bash
 git tag libvisio-v0.1.10 && git push origin libvisio-v0.1.10
@@ -458,17 +547,24 @@ white-backed PNG bytes.
 - Blocks all external file/network `href` image loads (inline `data:` URIs only).
 - Bounded output sizing (`max_side` and `max_pixels`).
 - Deterministic sans-serif CJK/Latin font fallback (`Noto Sans CJK SC`,
-  `Carlito`, `Liberation Sans`, `DejaVu Sans`, `WenQuanYi Zen Hei`, falling back
-  to system fonts on macOS).
+  `Carlito`, `Liberation Sans`, `DejaVu Sans`, `WenQuanYi Zen Hei`; on Windows
+  the curated `%WINDIR%\Fonts` list — `Microsoft YaHei`, `SimSun`, `Segoe UI`,
+  ... — is loaded instead of walking hundreds of faces, and system fonts are the
+  last resort).
 
 ### Build & artifacts
 
 ```bash
-bash svgrender/build.sh
+bash svgrender/build.sh                 # add --target windows-amd64 for Windows
 ```
 
-Output lands in `svgrender/dist/svgrender-v<version>-<target>.tar.gz` plus a
-`.sha256` file:
+The Windows target needs a MinGW-w64 gcc on `PATH` (MSYS2 MINGW64 shell or Git
+Bash with the mingw64 toolchain) and `rustup target add x86_64-pc-windows-gnu`;
+the archive ships `lib/libsvgrender.a` built for
+`x86_64-pc-windows-gnu`, i.e. the runtime the Go sidecar's cgo link uses.
+
+Output lands in `svgrender/dist/svgrender-v<version>-<target>.tar.gz` — a `.zip`
+for `windows-amd64` — plus a `.sha256` file:
 
 ```
 ./
@@ -482,10 +578,11 @@ Output lands in `svgrender/dist/svgrender-v<version>-<target>.tar.gz` plus a
 
 ### Releasing svgrender
 
-`.github/workflows/svgrender-release.yml` builds and smoke-tests all 4 targets
-(`linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`) — including a
-PNG render smoke test and `ubuntu-22.04` glibc 2.35 portability gate — and
-publishes tarballs + `checksums.txt`.
+`.github/workflows/svgrender-release.yml` builds and smoke-tests all 5 targets
+(`linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`)
+— including a PNG render smoke test, an `ubuntu-22.04` glibc 2.35 portability
+gate, and a real link-and-render run on Windows — and publishes
+tarballs/zips + `checksums.txt`.
 
 ```bash
 git tag svgrender-v0.45.1 && git push origin svgrender-v0.45.1

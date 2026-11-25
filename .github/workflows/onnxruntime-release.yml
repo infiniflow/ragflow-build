@@ -5,6 +5,10 @@ name: onnxruntime release
 # here while everything it executes lives under onnxruntime/.
 
 on:
+  pull_request:
+    paths:
+      - 'onnxruntime/**'
+      - '.github/workflows/onnxruntime-release.yml'
   push:
     tags:
       # The tag carries the version: pushing release-v1.30.0 builds and
@@ -16,6 +20,10 @@ on:
     inputs:
       ort_version:
         description: 'onnxruntime tag to build (default: onnxruntime/ORT_VERSION)'
+        required: false
+        default: ''
+      targets:
+        description: 'Comma-separated targets to build (default: all). A partial list APPENDS its archives to the existing release instead of replacing it, e.g. "windows-x64".'
         required: false
         default: ''
       dry_run:
@@ -33,6 +41,31 @@ permissions:
 env:
   # keep in sync with onnxruntime/ORT_VERSION when bumping manually
   ORT_PKG: onnxruntime
+  # target -> runner, the single source of truth for the build matrix. The
+  # `targets` input of a manual run narrows it (comma separated), so a single
+  # platform can be rebuilt and appended to the already published release
+  # without touching the archives that are already there.
+  #   linux-x86_64: ubuntu-22.04 pins glibc 2.35 / GCC 11.4 for the consumers.
+  #   windows-x64 : MSVC build (upstream ORT has no MinGW support), ships
+  #                 lib/onnxruntime.lib and needs lib.exe for packaging.
+  #   windows-arm64: same x64 runner, arm64 MSVC cross tools
+  #                 (ilammy/msvc-dev-cmd arch amd64_arm64), VS generator because
+  #                 ORT's build.py refuses to cross-compile with Ninja. The smoke
+  #                 test only links: an x64 runner cannot execute an arm64 binary.
+  #
+  # A pull request builds only PR_TARGETS: reviewing a change should not spend
+  # hours rebuilding every published platform (the full matrix still runs on a
+  # tag push and on an unfiltered workflow_dispatch).
+  PR_TARGETS: windows-x64
+  TARGET_MATRIX: |
+    [
+      {"target": "linux-x86_64", "variant": "minimal", "os": "ubuntu-22.04"},
+      {"target": "linux-aarch64", "variant": "minimal", "os": "ubuntu-24.04-arm"},
+      {"target": "osx-arm64", "variant": "minimal", "os": "macos-latest"},
+      {"target": "osx-universal", "variant": "minimal", "os": "macos-latest"},
+      {"target": "windows-x64", "variant": "minimal", "os": "windows-latest"},
+      {"target": "windows-arm64", "variant": "minimal", "os": "windows-latest"}
+    ]
 
 jobs:
   prepare:
@@ -41,6 +74,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
       base_version: ${{ steps.version.outputs.base_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      matrix: ${{ steps.version.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: version
@@ -48,15 +83,17 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ github.event.inputs.ort_version }}
+          INPUT_TARGETS: ${{ github.event.inputs.targets }}
         run: |
           set -euo pipefail
           # 1. tag push: the tag name carries the version
           # 2. manual run: the ort_version input
           # 3. fallback: whatever is pinned in onnxruntime/ORT_VERSION
           version=""
+          tag=""
           case "$REF_NAME" in
-            release-v*)     version="${REF_NAME#release-}" ;;
-            onnxruntime-v*) version="${REF_NAME#onnxruntime-}" ;;
+            release-v*)     tag="$REF_NAME"; version="${REF_NAME#release-}" ;;
+            onnxruntime-v*) tag="$REF_NAME"; version="${REF_NAME#onnxruntime-}" ;;
           esac
           [ -n "$version" ] || version="$INPUT_VERSION"
           [ -n "$version" ] || version="$(tr -d '[:space:]' < "${{ env.ORT_PKG }}/ORT_VERSION")"
@@ -72,17 +109,56 @@ jobs:
             *) echo "::error::version '$version' must start with 'v' (e.g. v1.29.0)"; exit 1 ;;
           esac
 
-          # The upstream onnxruntime is fetched from microsoft/onnxruntime, where
-          # only real releases exist (e.g. v1.29.0). A release tag may carry a
-          # vendor suffix like -patch1; strip it to get the tag we actually fetch
-          # and build (the patch is applied on top by init-submodules.sh).
+          # The upstream onnxruntime is fetched from the gitcode.com mirror (see
+          # .gitmodules; github.com/microsoft/onnxruntime is gone), where only
+          # real releases exist (e.g. v1.29.0). A release tag may carry a vendor
+          # suffix like -patch1; strip it to get the tag we actually fetch and
+          # build (the patch is applied on top by init-submodules.sh).
           base_version="${version%-*}"
           [ "$base_version" != "$version" ] && \
             echo "::notice::release tag '$version' -> fetching upstream '$base_version' + vendored patches"
 
-          echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
-          echo "onnxruntime version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME)"
+          # A manual run has no tag ref, so the release tag is derived from the
+          # version. That is also what makes a partial rebuild land on the
+          # release that is already published instead of creating a new one.
+          [ -n "$tag" ] || tag="onnxruntime-${version}"
+
+          # A pull request builds only PR_TARGETS unless it was targeted
+          # explicitly, so reviewing a dependency change does not rebuild the
+          # whole published matrix.
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -z "$INPUT_TARGETS" ]; then
+            INPUT_TARGETS="$PR_TARGETS"
+            echo "pull request: building $INPUT_TARGETS only"
+          fi
+
+          # A job-level if cannot see the matrix, so the restriction happens
+          # here and the build job consumes the already filtered matrix.
+          matrix="$(printf '%s' "$TARGET_MATRIX" | jq -c --arg targets "$INPUT_TARGETS" '
+            ($targets | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $want
+            | (if ($want | length) == 0 then . else map(select(.target as $t | $want | index($t))) end)
+            | {include: .}')"
+          if [ -n "$INPUT_TARGETS" ]; then
+            # wc -l counts newlines and `printf '%s'` writes no trailing one, so
+            # counting this way always reported 0 targets and rejected every
+            # filtered build. Ask jq which names are unknown instead.
+            unknown="$(printf '%s' "$TARGET_MATRIX" | jq -r --arg targets "$INPUT_TARGETS" '
+              ($targets | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $want
+              | [.[].target] as $known
+              | $want | map(select(. as $w | $known | index($w) | not)) | join(", ")')"
+            if [ -n "$unknown" ]; then
+              echo "::error::unknown target(s): $unknown; known targets: $(printf '%s' "$TARGET_MATRIX" | jq -r '.[].target' | tr '\n' ' ')"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "value=$version"
+            echo "base_version=$base_version"
+            echo "tag=$tag"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "onnxruntime version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME, release tag: $tag)"
+          echo "build matrix: $matrix"
 
   build:
     name: build ${{ matrix.target }}
@@ -91,43 +167,7 @@ jobs:
     timeout-minutes: 720
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: linux-x86_64
-            variant: minimal
-            # ubuntu-22.04 pins glibc 2.35 / GCC 11.4: the oldest toolchain that
-            # still satisfies ORT's GCC>=11.1 floor while NOT emitting the
-            # non-portable __isoc23_* (glibc>=2.38) or _M_replace_cold (GCC>=12)
-            # symbols. The published .a must link on the consumer's Ubuntu 22.04.
-            os: ubuntu-22.04
-          # Native arm64 runner. If your repo has no access to arm runners,
-          # change os to ubuntu-latest: onnxruntime/build.sh then falls back to
-          # aarch64 cross compilation (see scripts/cross-linux-aarch64.sh).
-          - target: linux-aarch64
-            variant: minimal
-            os: ubuntu-24.04-arm
-          # Only the "minimal" variant is built: DeepDoc weights ship as .ort
-          # with HardSwish decomposed to Mul/Clip/Div, so no consumer needs the
-          # full operator set. (The -full variant was removed 2026-10-16 —
-          # vanilla ORT has no HardSwish CPU kernel, so its smoke test could
-          # never pass.)
-          - target: osx-arm64
-            variant: minimal
-            os: macos-latest
-          - target: osx-universal
-            variant: minimal
-            os: macos-latest
-          # Windows is disabled for now: the runner image has no Visual Studio
-          # instance, so CMake configure dies with
-          #   Generator "Visual Studio 17 2022" could not find any instance of
-          #   Visual Studio.
-          # onnxruntime/build.sh already supports both windows-x64 and
-          # windows-arm64; uncomment these once a runner with the MSVC
-          # toolchain (and vcvarsall / lib.exe for packaging) is available.
-          # - target: windows-x64
-          #   os: windows-latest
-          # - target: windows-arm64
-          #   os: windows-latest
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -156,10 +196,15 @@ jobs:
       - name: Install build deps
         run: python -m pip install --upgrade pip "cmake>=3.28" flatbuffers
 
-      - name: Setup Ninja (unix)
-        if: runner.os != 'Windows'
+      # Ninja on every platform: on Windows it is what keeps the build off the
+      # version-pinned "Visual Studio 17 2022" generator (upstream build.py's
+      # hardcoded default), which a newer runner image cannot satisfy.
+      - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@master
 
+      # Sets up the MSVC environment (vcvars) so ninja finds cl, and so
+      # package.sh finds lib.exe. Without it the Windows configure/build steps
+      # have no compiler at all.
       - name: Setup MSVC (windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -168,10 +213,63 @@ jobs:
 
       - name: Fetch onnxruntime ${{ needs.prepare.outputs.base_version }}
         shell: bash
+        # The submodules are public, so the script clones them anonymously first;
+        # the token is only the fallback for a fork that points them somewhere
+        # private (see the credentials block in init-submodules.sh).
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "${{ needs.prepare.outputs.base_version }}" > "${{ env.ORT_PKG }}/ORT_VERSION"
           bash "${{ env.ORT_PKG }}/scripts/init-submodules.sh"
+
+      # Ninja only rebuilds targets older than their inputs, so the whole tree is
+      # cached: CMake's cache, the fetched _deps and every object. The key covers
+      # what actually changes the artifacts (ORT version, build.sh, operator
+      # config, patches), so a smoke-test or packaging tweak no longer costs a
+      # full rebuild.
+      - name: Restore the build tree
+        id: ort-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ORT_PKG }}/build/${{ matrix.target }}
+          key: ort-build-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-${{ hashFiles('onnxruntime/build.sh', 'onnxruntime/required_operators.config', 'onnxruntime/patches/**') }}
+          # A changed input still reuses the old tree: CMake reconfigures and only
+          # what the change actually affects is recompiled.
+          restore-keys: |
+            ort-build-${{ matrix.target }}-${{ matrix.variant }}-${{ needs.prepare.outputs.base_version }}-
+
+      # A fresh checkout is newer than every object in the restored tree, which
+      # would make ninja rebuild all of it. Dating the sources back keeps the
+      # restored tree newer than its inputs.
+      - name: Age the sources so the restored tree stays incremental
+        if: steps.ort-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="${{ env.ORT_PKG }}/onnxruntime"
+          [ -d "$src" ] || exit 0
+          find "$src" -type f \
+            \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+               -o -name '*.h' -o -name '*.hpp' -o -name '*.hxx' \) \
+            -exec touch -t 200001010000 {} +
+          # Directories carry the mtime CMake's glob verification compares, so
+          # they are dated back as well; otherwise a fresh checkout makes CMake
+          # think a GLOB changed and reconfigure from scratch.
+          find "$src" -type d -exec touch -t 200001010000 {} +
+
+          # The cached CMakeCache records the cmake that configured it; a runner
+          # image update can remove that version. Dropping only the cache lets
+          # CMake reconfigure while every restored object stays reusable.
+          for cache in "${{ env.ORT_PKG }}/build/${{ matrix.target }}"/*/CMakeCache.txt; do
+            [ -f "$cache" ] || continue
+            tool="$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$cache" | head -1)"
+            if [ -z "$tool" ] || [ -e "$tool" ]; then
+              continue
+            fi
+            echo "dropping $cache: cached cmake '$tool' no longer exists"
+            rm -f "$cache"
+          done
 
       - name: Build ${{ matrix.target }}
         shell: bash
@@ -186,6 +284,15 @@ jobs:
           # need the com.microsoft fused kernels listed in that config.
           bash "${{ env.ORT_PKG }}/build.sh" --target "${{ matrix.target }}"
 
+      # Saved here, not at job teardown: a failing smoke test or a rejected
+      # release must not throw the compilation away.
+      - name: Save the build tree
+        if: success() && steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ORT_PKG }}/build/${{ matrix.target }}
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+
       - name: Smoke test (load the DeepDoc models)
         # A build that compiles fine can still be unable to load the models it
         # was reduced for, so link the packaged archive and create a session for
@@ -197,26 +304,53 @@ jobs:
         run: |
           set -euo pipefail
           pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          zip_path=""
+          for candidate in "$pkg"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            zip_path="$candidate"
+            break
+          done
           [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
 
           work="$(mktemp -d)"
-          unzip -q "$zip_path" -d "$work"
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q "$zip_path" -d "$work"
+          else
+            # Git Bash has no unzip; PowerShell's Expand-Archive does the job.
+            powershell -NoProfile -NonInteractive -Command \
+              "Expand-Archive -LiteralPath '$(cygpath -w "$zip_path")' -DestinationPath '$(cygpath -w "$work")' -Force"
+          fi
           lib_dir="$(find "$work" -type d -name lib -print -quit)"
           [ -n "$lib_dir" ] || { echo "::error::no lib/ directory in $zip_path"; exit 1; }
           root="$(dirname "$lib_dir")"
-          [ -f "$root/lib/libonnxruntime.a" ] || { echo "::error::libonnxruntime.a missing"; exit 1; }
+          if [ -f "$root/lib/libonnxruntime.a" ]; then
+            ort_lib="$root/lib/libonnxruntime.a"
+          elif [ -f "$root/lib/onnxruntime.lib" ]; then
+            ort_lib="$root/lib/onnxruntime.lib"
+          else
+            echo "::error::no packaged ONNX Runtime library under $root/lib"; exit 1
+          fi
+
+          # An x64 runner cannot execute an arm64 binary (Windows emulates only
+          # the other direction), so the arm64 leg stops after linking the probe:
+          # no model is downloaded or loaded there.
+          run_probe=1
+          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+            run_probe=0
+          fi
 
           models="$work/models"
           mkdir -p "$models"
-          for m in $DEEPDOC_MODELS; do
-            # --retry alone does not cover transport errors such as
-            # "SSL_ERROR_SYSCALL", and a flaky download must not fail a release.
-            curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
-              -o "$models/$m.ort" \
-              "$HF_ENDPOINT/InfiniFlow/deepdoc/resolve/main/$m.ort" \
-              || { echo "::error::failed to download $m.ort"; exit 1; }
-          done
+          if [ "$run_probe" -eq 1 ]; then
+            for m in $DEEPDOC_MODELS; do
+              # --retry alone does not cover transport errors such as
+              # "SSL_ERROR_SYSCALL", and a flaky download must not fail a release.
+              curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
+                -o "$models/$m.ort" \
+                "$HF_ENDPOINT/InfiniFlow/deepdoc/resolve/main/$m.ort" \
+                || { echo "::error::failed to download $m.ort"; exit 1; }
+            done
+          fi
 
           cat > "$work/probe.c" <<'EOF'
           #include <stdio.h>
@@ -224,9 +358,25 @@ jobs:
           int main(int argc, char **argv) {
               const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
               OrtEnv *env = NULL; OrtSessionOptions *so = NULL; OrtSession *s = NULL;
+              const ORTCHAR_T *model_path;
+              if (argc < 2) return 2;
+          #ifdef _WIN32
+              /* CreateSession takes ORTCHAR_T, i.e. wchar_t on Windows: handing it
+                 the char* argv is a hard error in C++ and a garbage path in C. */
+              {
+                  wchar_t wpath[4096];
+                  int i;
+                  for (i = 0; i < 4095 && argv[1][i] != '\0'; ++i)
+                      wpath[i] = (wchar_t)(unsigned char)argv[1][i];
+                  wpath[i] = L'\0';
+                  model_path = wpath;
+              }
+          #else
+              model_path = argv[1];
+          #endif
               if (api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "smoke", &env) != NULL) return 2;
               if (api->CreateSessionOptions(&so) != NULL) return 2;
-              OrtStatus *st = api->CreateSession(env, argv[1], so, &s);
+              OrtStatus *st = api->CreateSession(env, model_path, so, &s);
               if (st != NULL) {
                   fprintf(stderr, "FAIL %s: %s\n", argv[1], api->GetErrorMessage(st));
                   return 1;
@@ -236,22 +386,55 @@ jobs:
           }
           EOF
 
-          cxx="${CXX:-c++}"
-          if [ "$(uname -s)" = "Darwin" ]; then
-            # ORT's static lib references macOS system frameworks (absl/cctz pulls
-            # CoreFoundation for local_time_zone(); apple_log_sink.mm pulls
-            # Foundation for NSLog). They are left unresolved in the .a and must
-            # be supplied by the final linker.
-            libs="-lc++ -lpthread -lm -framework CoreFoundation -framework Foundation -framework Security"
-          else
-            libs="-lpthread -ldl -lm"
+          case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*)
+              # MSVC tools are native Windows binaries: hand them Windows paths
+              # (cygpath -m keeps the forward slashes bash needs on the way in).
+              # Argument conversion is off because '/' options look like POSIX
+              # paths to the MSYS2 runtime and arrive at cl as
+              # "<msys root>/nologo" -- everything below is already a Windows
+              # path, so there is nothing left for the runtime to translate.
+              # /MD matches how ORT's static library was built (CMake default is
+              # the DLL runtime): bare cl defaults to /MT and then every ucrtbase
+              # import in the archive shows up as __imp_* unresolved.
+              # /Tp<file> (not /TP) compiles just the probe as C++ so the C++
+              # runtime is linked too: /TP marks *every* command line file as a
+              # source file, so cl tries to compile onnxruntime.lib as C++ and
+              # dies with C2018 on the archive's binary header.
+              w() { cygpath -m "$1"; }
+              MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+                cl /nologo /MD /O2 "/I$(w "$root/include")" \
+                   "/Tp$(w "$work/probe.c")" "/Fe:$(w "$work/probe.exe")" \
+                   "$(w "$ort_lib")" advapi32.lib shell32.lib ole32.lib user32.lib \
+                || { echo "::error::failed to link the probe against $ort_lib"; exit 1; }
+              probe="$work/probe.exe"
+              ;;
+            Darwin*)
+              # ORT's static lib references macOS system frameworks (absl/cctz
+              # pulls CoreFoundation for local_time_zone(); apple_log_sink.mm
+              # pulls Foundation for NSLog). They are left unresolved in the .a
+              # and must be supplied by the final linker.
+              cxx="${CXX:-c++}"
+              "$cxx" -O0 -o "$work/probe" "$work/probe.c" -I"$root/include" "$ort_lib" \
+                -lc++ -lpthread -lm -framework CoreFoundation -framework Foundation -framework Security
+              probe="$work/probe"
+              ;;
+            *)
+              cxx="${CXX:-c++}"
+              "$cxx" -O0 -o "$work/probe" "$work/probe.c" -I"$root/include" "$ort_lib" \
+                -lpthread -ldl -lm
+              probe="$work/probe"
+              ;;
+          esac
+
+          if [ "$run_probe" -eq 0 ]; then
+            echo "windows-arm64: linked $probe against $ort_lib (not executed)"
+            exit 0
           fi
-          "$cxx" -O0 -o "$work/probe" "$work/probe.c" -I"$root/include" \
-              "$root/lib/libonnxruntime.a" $libs
 
           fail=0
           for m in $DEEPDOC_MODELS; do
-            "$work/probe" "$models/$m.ort" || fail=1
+            "$probe" "$models/$m.ort" || fail=1
           done
           if [ "$fail" -ne 0 ]; then
             echo "::error::the build cannot load every DeepDoc model"
@@ -272,7 +455,12 @@ jobs:
         run: |
           set -euo pipefail
           pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          zip_path=""
+          for candidate in "$pkg"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            zip_path="$candidate"
+            break
+          done
           [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
           work="$(mktemp -d)"
           unzip -q "$zip_path" -d "$work"
@@ -305,7 +493,12 @@ jobs:
         run: |
           set -euo pipefail
           pkg="${{ env.ORT_PKG }}"
-          zip_path="$(ls "$pkg"/dist/*.zip | head -1)"
+          zip_path=""
+          for candidate in "$pkg"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            zip_path="$candidate"
+            break
+          done
           [ -n "$zip_path" ] || { echo "::error::no packaged zip found in $pkg/dist"; exit 1; }
           work="$(mktemp -d)"
           unzip -q "$zip_path" -d "$work"
@@ -333,7 +526,7 @@ jobs:
   release:
     name: release
     needs: [prepare, build]
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || !inputs.dry_run) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -346,6 +539,29 @@ jobs:
 
       - name: List artifacts
         run: ls -lh dist
+
+      # A partial build (targets input) must not replace a published release:
+      # keep the archives that are already there and only add the ones built
+      # now. The existing checksums.txt is the source of truth for what is
+      # already published, so it is fetched and merged rather than rewritten.
+      - name: Fetch the published release state
+        id: existing
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.targets != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p existing
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'checksums.txt' --dir existing || true
+            echo "append=true" >> "$GITHUB_OUTPUT"
+            echo "appending to the existing release $TAG"
+          else
+            echo "append=false" >> "$GITHUB_OUTPUT"
+            echo "no release for $TAG yet; publishing a new one"
+          fi
 
       - name: Build release notes
         # Generated from the artifacts that actually exist, so the download
@@ -407,6 +623,15 @@ jobs:
 
           # one file with every checksum, for a single verification pass
           cat dist/*.sha256 > dist/checksums.txt
+          if [ -f existing/checksums.txt ]; then
+            # Union of what is already published and what this run built; a name
+            # in both keeps this run's line so a re-run corrects a stale digest
+            # instead of duplicating the entry.
+            awk 'FNR==NR { if (NF) seen[$NF]=1; print; next }
+                 { if (NF && !($NF in seen)) print }' \
+              dist/checksums.txt existing/checksums.txt > dist/checksums.merged
+            mv dist/checksums.merged dist/checksums.txt
+          fi
 
           {
             echo
@@ -428,6 +653,10 @@ jobs:
             echo "g++ app.cc -I onnxruntime-${version}-linux-x86_64/include \\"
             echo "    onnxruntime-${version}-linux-x86_64/lib/libonnxruntime.a \\"
             echo "    -lpthread -ldl -lm -o app"
+            echo
+            echo "# windows: the archive is a static library; link it with MSVC"
+            echo "cl app.cc /I onnxruntime-${version}-windows-x64/include \\"
+            echo "   onnxruntime-${version}-windows-x64/lib/onnxruntime.lib advapi32.lib"
             echo '```'
             echo
             echo "Use \`g++\` (or add \`-lstdc++\`): this is a C++ library even when your own code is C."
@@ -440,9 +669,12 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('onnxruntime-{0}', needs.prepare.outputs.version) || github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
           name: onnxruntime ${{ needs.prepare.outputs.version }}
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          # Never demote an already published release back to a draft when a
+          # partial build appends to it.
+          draft: ${{ steps.existing.outputs.append != 'true' && github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          append_body: ${{ steps.existing.outputs.append == 'true' }}
           prerelease: false
           body_path: notes.md
           files: |

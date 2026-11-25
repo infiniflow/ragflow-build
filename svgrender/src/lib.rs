@@ -10,6 +10,111 @@ use resvg::usvg::{fontdb, ImageHrefResolver, Options, Tree};
 const DEFAULT_MAX_SIDE: u32 = 2048;
 const DEFAULT_MAX_PIXELS: u64 = 10_000_000;
 
+// Font files a Windows install ships, in a deterministic fallback order:
+// Microsoft YaHei (Latin + Simplified Chinese in one sans face), SimSun / SimHei
+// as the CJK fallbacks, then the Latin faces every install carries.
+#[cfg(target_os = "windows")]
+const WINDOWS_FONT_FILES: &[&str] = &[
+    "msyh.ttc",
+    "msyhbd.ttc",
+    "msyhl.ttc",
+    "simsun.ttc",
+    "simhei.ttf",
+    "segoeui.ttf",
+    "segoeuib.ttf",
+    "seguisym.ttf",
+    "seguiemj.ttf",
+    "arial.ttf",
+    "arialbd.ttf",
+    "calibri.ttf",
+    "tahoma.ttf",
+    "times.ttf",
+    "timesbd.ttf",
+    "cour.ttf",
+    "consola.ttf",
+];
+
+/// Directories Windows keeps faces in: the machine-wide `%WINDIR%\Fonts` and the
+/// per-user `%LOCALAPPDATA%\Microsoft\Windows\Fonts` written by "Install for me".
+/// Resolved at runtime so a relocated Windows directory is still found.
+#[cfg(target_os = "windows")]
+fn windows_font_dirs() -> Vec<std::path::PathBuf> {
+    let root = std::env::var_os("WINDIR")
+        .or_else(|| std::env::var_os("SystemRoot"))
+        .unwrap_or_else(|| std::ffi::OsString::from("C:\\Windows"));
+    let mut dirs = vec![Path::new(&root).join("Fonts")];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(
+            Path::new(&local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
+    }
+    dirs
+}
+
+// Preferred generic families, most wanted first. Windows lists its own faces
+// ahead of the unix names so a stock install picks a CJK sans instead of falling
+// through to the fontdb default. The non-Windows lists are unchanged: the
+// fallback order that ships on Linux/macOS must stay byte-identical to what they
+// already render with.
+#[cfg(target_os = "windows")]
+const PREFERRED_SANS: &[&str] = &[
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "Microsoft JhengHei",
+    "SimHei",
+    "Segoe UI",
+    "Arial",
+    "Noto Sans CJK SC",
+    "Carlito",
+    "Liberation Sans",
+    "DejaVu Sans",
+];
+#[cfg(not(target_os = "windows"))]
+const PREFERRED_SANS: &[&str] = &[
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+    "Carlito",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "WenQuanYi Zen Hei",
+    "Arial",
+    "Helvetica",
+];
+
+#[cfg(target_os = "windows")]
+const PREFERRED_SERIF: &[&str] = &[
+    "SimSun",
+    "Times New Roman",
+    "Caladea",
+    "Liberation Serif",
+    "DejaVu Serif",
+];
+#[cfg(not(target_os = "windows"))]
+const PREFERRED_SERIF: &[&str] = &[
+    "Caladea",
+    "Liberation Serif",
+    "DejaVu Serif",
+    "Times New Roman",
+];
+
+#[cfg(target_os = "windows")]
+const PREFERRED_MONO: &[&str] = &[
+    "Consolas",
+    "Courier New",
+    "Liberation Mono",
+    "DejaVu Sans Mono",
+];
+#[cfg(not(target_os = "windows"))]
+const PREFERRED_MONO: &[&str] = &[
+    "Noto Sans Mono CJK SC",
+    "Liberation Mono",
+    "DejaVu Sans Mono",
+    "Courier New",
+];
+
 struct FontState {
     db: Arc<fontdb::Database>,
     default_sans: String,
@@ -75,51 +180,45 @@ fn build_font_state() -> FontState {
         load_dir_matching(&mut db, dir);
     }
 
-    // macOS / minimal host fallback when none of the curated Linux paths exist.
+    // Windows has no fontconfig and none of the paths above, so load a fixed list
+    // out of the Windows font directories instead of walking them: %WINDIR%\Fonts
+    // holds several hundred faces, and parsing all of them would cost far more
+    // memory and startup time than the handful a diagram can reference.
+    #[cfg(target_os = "windows")]
+    {
+        for dir in windows_font_dirs() {
+            for file in WINDOWS_FONT_FILES {
+                let path = dir.join(file);
+                if path.is_file() {
+                    let _ = db.load_font_file(&path);
+                }
+            }
+        }
+    }
+
+    // macOS / minimal host fallback when none of the curated paths exist.
     if db.is_empty() {
         db.load_system_fonts();
     }
 
     // Prefer a CJK-capable sans-serif as the default fallback family when present
-    // (Noto Sans CJK SC contains crisp Latin + Simplified Chinese glyphs together),
-    // falling back to Latin metric-compatible sans-serifs otherwise.
-    let preferred_sans = [
-        "Noto Sans CJK SC",
-        "Noto Sans SC",
-        "Carlito",
-        "Liberation Sans",
-        "DejaVu Sans",
-        "WenQuanYi Zen Hei",
-        "Arial",
-        "Helvetica",
-    ];
+    // (Noto Sans CJK SC / Microsoft YaHei contain crisp Latin + Simplified Chinese
+    // glyphs together), falling back to Latin metric-compatible sans-serifs.
     let mut default_sans = "sans-serif".to_string();
-    for fam in preferred_sans {
+    for &fam in PREFERRED_SANS {
         if has_family(&db, fam) {
             db.set_sans_serif_family(fam);
             default_sans = fam.to_string();
             break;
         }
     }
-    let preferred_serif = [
-        "Caladea",
-        "Liberation Serif",
-        "DejaVu Serif",
-        "Times New Roman",
-    ];
-    for fam in preferred_serif {
+    for &fam in PREFERRED_SERIF {
         if has_family(&db, fam) {
             db.set_serif_family(fam);
             break;
         }
     }
-    let preferred_mono = [
-        "Noto Sans Mono CJK SC",
-        "Liberation Mono",
-        "DejaVu Sans Mono",
-        "Courier New",
-    ];
-    for fam in preferred_mono {
+    for &fam in PREFERRED_MONO {
         if has_family(&db, fam) {
             db.set_monospace_family(fam);
             break;

@@ -278,6 +278,19 @@ find_msvc_lib() {
     return 1
 }
 
+# MSVC tools are native Windows binaries: neither the /c/... form of a path nor
+# the MSYS2 /tmp mount means anything to them, and MSYS2 does not translate
+# path-like arguments that sit inside a response file. cygpath -m yields C:/...
+# which both bash and lib.exe accept, so every path crosses the boundary through
+# this helper.
+to_win() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 merge_libs() {
     local out="$1"; shift
     local mri rsp
@@ -287,7 +300,7 @@ merge_libs() {
             libtool -static -o "$out" "$@"
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            local lib_exe
+            local lib_exe lib_path
             if ! lib_exe="$(find_msvc_lib)"; then
                 echo "error: MSVC 'lib.exe' not found." >&2
                 echo "       Run this from a Visual Studio developer prompt or" >&2
@@ -295,9 +308,19 @@ merge_libs() {
                 return 1
             fi
             echo "    using $(printf '%s' "$lib_exe")"
-            rsp="$(mktemp)"
-            printf '"%s"\n' "$@" > "$rsp"
-            "$lib_exe" /NOLOGO "/OUT:$out" "@$rsp"
+            rsp="$(to_win "$(mktemp)")"
+            : > "$rsp"
+            for lib_path in "$@"; do
+                printf '"%s"\n' "$(to_win "$lib_path")" >> "$rsp"
+            done
+            # '/' prefixed options are POSIX-looking arguments, so the MSYS2/Git
+            # Bash runtime rewrites them into paths before lib.exe sees them:
+            # /NOLOGO arrives as "<msys root>/NOLOGO" and the librarian answers
+            # LNK1181 "cannot open input file". '-' prefixed options are the same
+            # switches without that shape, and the exclusion keeps the runtime
+            # from touching anything else on this command line.
+            MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+                "$lib_exe" -NOLOGO "-OUT:$(to_win "$out")" "@$rsp"
             rm -f "$rsp"
             ;;
         *)
@@ -362,7 +385,15 @@ merge_libs "$STAGE_DIR/lib/$LIB_NAME" "${ORDERED[@]}"
     echo
 
     echo "usage         :"
-    echo "  g++ app.cc -I<pkg>/include <pkg>/lib/${LIB_NAME} -lpthread -ldl -lm -o app"
+    case "$TARGET" in
+        windows-*)
+            echo "  cl app.cc /I <pkg>/include <pkg>/lib/${LIB_NAME} advapi32.lib"
+            echo "  (MSVC; the archive references the MSVC runtime it was built against)"
+            ;;
+        *)
+            echo "  g++ app.cc -I<pkg>/include <pkg>/lib/${LIB_NAME} -lpthread -ldl -lm -o app"
+            ;;
+    esac
 } > "$STAGE_DIR/BUILD_INFO.txt"
 
 # --- archive -----------------------------------------------------------------
@@ -370,13 +401,53 @@ mkdir -p "$DIST_DIR"
 ARCHIVE_NAME="${PKG_NAME}.${ARCHIVE_EXT}"
 rm -f "$DIST_DIR/$ARCHIVE_NAME"
 
-# 'zip' when available (stores Unix permissions and symlinks correctly and does
-# not need an external compressor), otherwise fall back to tar's
-# --auto-compress, which picks the zip format from the .zip suffix.
-if command -v zip >/dev/null 2>&1; then
-    ( cd "$DIST_DIR" && zip -q -r -y "$ARCHIVE_NAME" "$PKG_NAME" )
-else
-    ( cd "$DIST_DIR" && tar -a -cf "$ARCHIVE_NAME" "$PKG_NAME" )
+# Every platform ships a .zip so consumers need one extraction tool only.
+# Git Bash ships GNU tar (no zip), and GNU tar's -a/--auto-compress has no
+# compressor for a .zip suffix: it writes a plain tar stream under that name,
+# which unzip rejects with "End-of-central-directory signature not found".
+# So the fallbacks have to be real zip writers, and the result is verified
+# below instead of being discovered by the consumer's smoke test.
+create_zip() {
+    if command -v zip >/dev/null 2>&1; then
+        ( cd "$DIST_DIR" && zip -q -r -y "$ARCHIVE_NAME" "$PKG_NAME" )
+        return 0
+    fi
+    # 7-Zip is on every GitHub Windows runner but not on PATH.
+    local seven_zip
+    for seven_zip in "/c/Program Files/7-Zip/7z.exe" \
+                     "/c/Program Files (x86)/7-Zip/7z.exe" 7z; do
+        command -v "$seven_zip" >/dev/null 2>&1 || continue
+        ( cd "$DIST_DIR" && "$seven_zip" a -tzip "$ARCHIVE_NAME" "$PKG_NAME" >/dev/null ) \
+            && return 0
+    done
+    # The bsdtar bundled with Windows 10+ understands -a; the GNU tar in Git
+    # Bash (earlier on PATH) does not.
+    if [ -x /c/Windows/System32/tar.exe ]; then
+        ( cd "$DIST_DIR" && /c/Windows/System32/tar.exe -a -cf "$ARCHIVE_NAME" "$PKG_NAME" ) \
+            && return 0
+    fi
+    # Last resort on a POSIX image that has no zip: write it with the stdlib.
+    if command -v python3 >/dev/null 2>&1; then
+        ( cd "$DIST_DIR" && python3 -c '
+import os, sys, zipfile
+name, root = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(name, "w", zipfile.ZIP_DEFLATED) as z:
+    for base, _, files in os.walk(root):
+        for f in files:
+            p = os.path.join(base, f)
+            z.write(p, os.path.relpath(p, ".").replace(os.sep, "/"))
+' "$ARCHIVE_NAME" "$PKG_NAME" ) && return 0
+    fi
+    echo "error: no zip writer found (install 'zip' or 7-Zip)" >&2
+    exit 1
+}
+
+create_zip
+
+# A "zip" that is really a tar must fail here, not in the release smoke test.
+if [ "$(head -c 2 "$DIST_DIR/$ARCHIVE_NAME")" != "PK" ]; then
+    echo "error: $DIST_DIR/$ARCHIVE_NAME is not a zip archive" >&2
+    exit 1
 fi
 
 if command -v sha256sum >/dev/null 2>&1; then

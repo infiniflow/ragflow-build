@@ -30,7 +30,46 @@ functions to `visio_ucnv_open`, `visio_ucnv_getNextUChar`, and
 bash libvisio/build.sh
 ```
 
-Output lands in `libvisio/dist/libvisio-<version>-<target>.tar.gz` and `.sha256`.
+Output lands in `libvisio/dist/libvisio-<version>-<target>.tar.gz` and `.sha256`
+(a `.zip` for the Windows target).
+
+## Windows
+
+Upstream only ships autotools, so MSVC is not an option: `windows-amd64` is
+built with the **MSYS2 MINGW64** (msvcrt) toolchain and ships ordinary MinGW-w64
+`.a` archives — the same runtime the Go sidecar's cgo link uses. Build it from
+an MSYS2 MINGW64 shell, not from Git Bash (autotools needs MSYS2's `make`,
+`pkg-config` and shell):
+
+```bash
+pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-boost pkgconf zip
+bash libvisio/build.sh --target windows-amd64
+```
+
+The script refuses to run when `gcc` is not a MinGW-w64 compiler or the boost
+headers are missing, and warns when `MSYSTEM` is `UCRT64`/`CLANG64` (a UCRT build
+would mix two C runtimes into one binary). The archive contents match the other
+platforms — `lib/libvisio-0.1.a`, `librevenge-*.a`, `libxml2.a` — and
+`-fPIC` is dropped because MinGW-w64 has no PIC distinction.
+
+`windows-arm64` is cross-compiled on the same x64 host with **llvm-mingw**
+(UCRT, the toolchain Go's `windows/arm64` cgo link uses), because MSYS2 has no
+`aarch64-w64-mingw32` gcc for an autotools build. The aarch64 zlib and boost come
+from the **CLANGARM64** prefix:
+
+```bash
+# llvm-mingw: https://github.com/mstorsjo/llvm-mingw/releases
+#   llvm-mingw-<ver>-ucrt-x86_64.zip -- put its bin/ on PATH
+pacman -S mingw-w64-clang-aarch64-zlib mingw-w64-clang-aarch64-boost \
+          make pkgconf m4 zip
+bash libvisio/build.sh --target windows-arm64
+```
+
+The script refuses to run without the cross tools, `/clangarm64/lib/libz.a` or
+the boost headers, exports `CC`/`AR`/`WINDRES` plus `--host=aarch64-w64-mingw32`,
+and points pkg-config at `PKG_CONFIG_LIBDIR=<install>/lib/pkgconfig:/clangarm64`
+so no x64 `.pc` file can leak into the target build. Results cannot be executed
+on an x64 runner; the smoke probe only links.
 
 ## Releasing
 
@@ -39,4 +78,4 @@ git tag libvisio-v0.1.10 && git push origin libvisio-v0.1.10
 ```
 
 Or run `.github/workflows/libvisio-release.yml` via **Actions → Run workflow**
-(`dry_run=true` builds and smoke-tests all 4 targets without publishing).
+(`dry_run=true` builds and smoke-tests all 6 targets without publishing).

@@ -14,6 +14,10 @@ on:
         description: 'svgrender version to build (default: svgrender/SVGRENDER_VERSION)'
         required: false
         default: ''
+      targets:
+        description: 'Comma-separated targets to build (default: all). A partial list APPENDS its archives to the existing release instead of replacing it, e.g. "windows-amd64".'
+        required: false
+        default: ''
       dry_run:
         description: 'Build only, do not publish a GitHub release'
         type: boolean
@@ -28,6 +32,29 @@ permissions:
 
 env:
   PKG_DIR: svgrender
+  # llvm-mingw is the only aarch64-w64-mingw32 toolchain available on an x64
+  # host; it is pinned so the arm64 leg does not drift with upstream releases.
+  LLVM_MINGW_VERSION: '20261117'
+  # target -> runner, the single source of truth for the build matrix. The
+  # `targets` input of a manual run narrows it (comma separated), so a single
+  # platform can be rebuilt and appended to the already published release
+  # without touching the archives that are already there.
+  #   linux-amd64  : ubuntu-22.04 pins glibc 2.35 for the consumers.
+  #   windows-amd64: MinGW-w64 / msvcrt staticlib, built for
+  #                  x86_64-pc-windows-gnu (the Go sidecar's cgo toolchain).
+  #   windows-arm64: LLVM/UCRT staticlib for aarch64-pc-windows-gnullvm. Cross
+  #                  compiled on the same x64 runner (rustc archives a staticlib
+  #                  without a linker); llvm-mingw is only needed to link the
+  #                  smoke probe, which is not executed.
+  TARGET_MATRIX: |
+    [
+      {"target": "linux-amd64", "os": "ubuntu-22.04"},
+      {"target": "linux-arm64", "os": "ubuntu-24.04-arm"},
+      {"target": "darwin-arm64", "os": "macos-latest"},
+      {"target": "darwin-amd64", "os": "macos-15-intel"},
+      {"target": "windows-amd64", "os": "windows-latest"},
+      {"target": "windows-arm64", "os": "windows-latest"}
+    ]
 
 jobs:
   prepare:
@@ -35,6 +62,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
+      tag: ${{ steps.version.outputs.tag }}
+      matrix: ${{ steps.version.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: version
@@ -42,11 +71,13 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_TARGETS: ${{ github.event.inputs.targets }}
         run: |
           set -euo pipefail
           version=""
+          tag=""
           case "$REF_NAME" in
-            svgrender-v*) version="${REF_NAME#svgrender-}" ;;
+            svgrender-v*) tag="$REF_NAME"; version="${REF_NAME#svgrender-}" ;;
           esac
           [ -n "$version" ] || version="$INPUT_VERSION"
           [ -n "$version" ] || version="$(tr -d '[:space:]' < "${{ env.PKG_DIR }}/SVGRENDER_VERSION")"
@@ -54,8 +85,38 @@ jobs:
             v*) : ;;
             *) echo "::error::version '$version' must start with 'v' (e.g. v0.45.1)"; exit 1 ;;
           esac
-          echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "svgrender version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME)"
+          # A manual run has no tag ref, so the release tag is derived from the
+          # version. That is also what makes a partial rebuild land on the
+          # release that is already published instead of creating a new one.
+          [ -n "$tag" ] || tag="svgrender-${version}"
+
+          # A job-level if cannot see the matrix, so the restriction happens
+          # here and the build job consumes the already filtered matrix.
+          matrix="$(printf '%s' "$TARGET_MATRIX" | jq -c --arg targets "$INPUT_TARGETS" '
+            ($targets | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $want
+            | (if ($want | length) == 0 then . else map(select(.target as $t | $want | index($t))) end)
+            | {include: .}')"
+          if [ -n "$INPUT_TARGETS" ]; then
+            # wc -l counts newlines and `printf '%s'` writes no trailing one, so
+            # counting this way always reported 0 targets and rejected every
+            # filtered build. Ask jq which names are unknown instead.
+            unknown="$(printf '%s' "$TARGET_MATRIX" | jq -r --arg targets "$INPUT_TARGETS" '
+              ($targets | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $want
+              | [.[].target] as $known
+              | $want | map(select(. as $w | $known | index($w) | not)) | join(", ")')"
+            if [ -n "$unknown" ]; then
+              echo "::error::unknown target(s): $unknown; known targets: $(printf '%s' "$TARGET_MATRIX" | jq -r '.[].target' | tr '\n' ' ')"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "value=$version"
+            echo "tag=$tag"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+          echo "svgrender version: $version (trigger: ${{ github.event_name }}, ref: $REF_NAME, release tag: $tag)"
+          echo "build matrix: $matrix"
 
   build:
     name: build ${{ matrix.target }}
@@ -64,17 +125,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: linux-amd64
-            # ubuntu-22.04 pins glibc 2.35 so the staticlib links on Ubuntu 22.04+ consumers.
-            os: ubuntu-22.04
-          - target: linux-arm64
-            os: ubuntu-24.04-arm
-          - target: darwin-arm64
-            os: macos-latest
-          - target: darwin-amd64
-            os: macos-15-intel
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -82,12 +133,113 @@ jobs:
         with:
           submodules: false
 
+      # Unpacks MSYS2 only. The packages are installed by the next step, in the
+      # very shell the toolchain is then taken from: the action's own `install:`
+      # input left a cached base installation without a compiler behind, and the
+      # failure only surfaced much later as "MinGW-w64 gcc not found on PATH".
+      - name: Setup MSYS2 (windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          # No `location`: the action's own default is the only layout it gets
+          # right. Passing C:\msys64 explicitly made it unpack a second level,
+          # so the root became C:\msys64\msys64 and every path below was off.
+          # Nothing here hardcodes the root any more; the install step exports
+          # the root its shell actually runs in.
+          msystem: MINGW64
+          update: false
+          cache: false
+
+      - name: Install MinGW-w64 / zip (windows, MSYS2)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm
+          pacman -S --needed --noconfirm zip
+          # windows-arm64 is cross-compiled and needs no MSYS2 compiler, only
+          # Info-ZIP zip for packaging.
+          if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+            pacman -S --needed --noconfirm mingw-w64-x86_64-gcc
+            # Assert on the installed file: the steps below are handed this very
+            # directory, so a base without the package must fail here.
+            test -x /mingw64/bin/gcc.exe || {
+              echo "::error::mingw-w64-x86_64-gcc is not installed under /mingw64"
+              pacman -Q | head -20
+              exit 1
+            }
+            gcc --version | head -1
+            gcc -dumpmachine
+          fi
+          # Hand the Git Bash steps the root this shell actually runs in
+          # instead of letting them assume C:\msys64: mingw64/bin supplies gcc
+          # for rustc, usr/bin supplies the Info-ZIP `zip` used for packaging.
+          printf 'MSYS2_ROOT=%s\n' "$(cygpath -w /)" >> "$(cygpath -u "$GITHUB_ENV")"
+
       - name: Setup Rust toolchain
+        if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust toolchain (windows target)
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'windows-arm64' && 'aarch64-pc-windows-gnullvm' || 'x86_64-pc-windows-gnu' }}
+
+      # Cross toolchain for the arm64 archive. rustc writes the staticlib itself
+      # and needs no linker, but the smoke probe is C and has to be linked for
+      # aarch64-w64-mingw32; llvm-mingw is the only toolchain that can do that
+      # from an x64 host (it bundles the UCRT sysroot).
+      - name: Setup llvm-mingw (windows-arm64)
+        if: matrix.target == 'windows-arm64'
+        shell: bash
+        env:
+          LLVM_MINGW_VERSION: ${{ env.LLVM_MINGW_VERSION }}
+        run: |
+          set -euo pipefail
+          zip_name="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-x86_64.zip"
+          work="$RUNNER_TEMP/llvm-mingw"
+          mkdir -p "$work"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$work/$zip_name" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${zip_name}"
+          unzip -q "$work/$zip_name" -d "$work"
+          bin="$(find "$work" -maxdepth 2 -type d -name bin -print -quit)"
+          [ -n "$bin" ] || { echo "::error::llvm-mingw unpacked without bin/"; exit 1; }
+          test -x "$bin/aarch64-w64-mingw32-clang.exe" || {
+            echo "::error::llvm-mingw ships no aarch64-w64-mingw32-clang"
+            ls "$bin" | head -20
+            exit 1
+          }
+          "$bin/aarch64-w64-mingw32-clang.exe" --version | head -1
+          printf 'LLVM_MINGW_BIN=%s\n' "$(cygpath -w "$bin")" >> "$GITHUB_ENV"
+          printf '%s\n' "$(cygpath -w "$bin")" >> "$GITHUB_PATH"
 
       - name: Build ${{ matrix.target }}
         shell: bash
         run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Packaging wants Info-ZIP `zip`, which lives under the MSYS2 root
+            # the install step exported. `usr/bin` is appended, not prepended:
+            # it only has to supply what Git Bash lacks, never shadow it.
+            # Assert outside the substitution: `:?` inside `$(...)` only kills
+            # the subshell and lets an empty value through.
+            : "${MSYS2_ROOT:?the MSYS2 install step exported no MSYS2_ROOT}"
+            msys_root="$(cygpath -u "$MSYS2_ROOT")"
+            export PATH="$PATH:$msys_root/usr/bin"
+            if [ "${{ matrix.target }}" = "windows-amd64" ]; then
+              # rustc links a windows-gnu staticlib with the MinGW-w64 gcc.
+              test -x "$msys_root/mingw64/bin/gcc.exe" || {
+                echo "::error::no gcc under $MSYS2_ROOT\\mingw64\\bin"
+                ls "$msys_root" 2>/dev/null | head -20 || true
+                exit 1
+              }
+              export PATH="$msys_root/mingw64/bin:$PATH"
+              gcc -dumpmachine
+            fi
+            command -v zip || echo "::warning::no Info-ZIP zip; packaging falls back to bsdtar"
+          fi
           bash "${{ env.PKG_DIR }}/build.sh" \
             --target "${{ matrix.target }}" \
             --version "${{ needs.prepare.outputs.version }}"
@@ -96,10 +248,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="$(ls "${{ env.PKG_DIR }}"/dist/*.tar.gz | head -1)"
+          cc_bin=cc
+          run_probe=1
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # The same MinGW-w64 gcc the build linked with. `cc` is not what
+            # Git Bash provides, so the compiler is named explicitly.
+            : "${MSYS2_ROOT:?the MSYS2 install step exported no MSYS2_ROOT}"
+            export PATH="$(cygpath -u "$MSYS2_ROOT")/mingw64/bin:$PATH"
+            cc_bin=gcc
+          fi
+          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+            # llvm-mingw's driver names the triple and carries its own UCRT
+            # sysroot. An x64 runner cannot execute an arm64 binary, so this leg
+            # only proves that the packaged archive links.
+            : "${LLVM_MINGW_BIN:?the llvm-mingw step exported no LLVM_MINGW_BIN}"
+            export PATH="$(cygpath -u "$LLVM_MINGW_BIN"):$PATH"
+            cc_bin=aarch64-w64-mingw32-clang
+            run_probe=0
+          fi
+          # One glob per platform: `ls a/*.tar.gz b/*.zip` fails with status 2
+          # whenever the second pattern matches nothing, and -o pipefail turns
+          # that into a silent exit.
+          archive=""
+          for candidate in "${{ env.PKG_DIR }}"/dist/*.tar.gz "${{ env.PKG_DIR }}"/dist/*.zip; do
+            [ -e "$candidate" ] || continue
+            archive="$candidate"
+            break
+          done
           [ -n "$archive" ] || { echo "::error::no archive found"; exit 1; }
           work="$(mktemp -d)"
-          tar -xzf "$archive" -C "$work"
+          case "$archive" in
+            *.zip)
+              if command -v unzip >/dev/null 2>&1; then
+                unzip -q "$archive" -d "$work"
+              else
+                # Git Bash has no unzip; PowerShell's Expand-Archive does the job.
+                powershell -NoProfile -NonInteractive -Command \
+                  "Expand-Archive -LiteralPath '$(cygpath -w "$archive")' -DestinationPath '$(cygpath -w "$work")' -Force"
+              fi
+              ;;
+            *)
+              tar -xzf "$archive" -C "$work"
+              ;;
+          esac
 
           cat > "$work/probe.c" << 'EOF'
           #include <stdio.h>
@@ -128,12 +319,24 @@ jobs:
           }
           EOF
 
-          if [ "$(uname -s)" = "Darwin" ]; then
-            cc -o "$work/probe" "$work/probe.c" -I"$work/include" "$work/lib/libsvgrender.a" -lm -lpthread -ldl
-          else
-            cc -o "$work/probe" "$work/probe.c" -I"$work/include" "$work/lib/libsvgrender.a" -lm -lpthread -ldl
+          probe="$work/probe"
+          libs="-lm -lpthread -ldl"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # A Rust std staticlib for windows-gnu references Win32 and
+            # CNG/registry entry points; the final link has to name them.
+            # -ldl is a Linux-only library, so the unix list is replaced.
+            probe="$work/probe.exe"
+            # A staticlib does not carry its `#[link]` requirements into a GNU
+            # ld link, so the C side names them. -lsynchronization is what
+            # std's futex uses for WaitOnAddress/WakeByAddress* (Win8 api-set).
+            libs="-lm -lws2_32 -luserenv -lbcrypt -lntdll -lole32 -lshell32 -ladvapi32 -lsynchronization"
           fi
-          "$work/probe"
+          "$cc_bin" -o "$probe" "$work/probe.c" -I"$work/include" "$work/lib/libsvgrender.a" $libs
+          if [ "$run_probe" -eq 1 ]; then
+            "$probe"
+          else
+            echo "windows-arm64: linked $probe against libsvgrender.a (not executed)"
+          fi
 
       - name: Portability gate (nm) — linux-amd64
         if: matrix.target == 'linux-amd64'
@@ -155,6 +358,7 @@ jobs:
           name: svgrender-${{ matrix.target }}
           path: |
             ${{ env.PKG_DIR }}/dist/*.tar.gz
+            ${{ env.PKG_DIR }}/dist/*.zip
             ${{ env.PKG_DIR }}/dist/*.sha256
           if-no-files-found: error
           retention-days: 7
@@ -173,6 +377,29 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A partial build (targets input) must not replace a published release:
+      # keep the archives that are already there and only add the ones built
+      # now. The existing checksums.txt is the source of truth for what is
+      # already published, so it is fetched and merged rather than rewritten.
+      - name: Fetch the published release state
+        id: existing
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.targets != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p existing
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'checksums.txt' --dir existing || true
+            echo "append=true" >> "$GITHUB_OUTPUT"
+            echo "appending to the existing release $TAG"
+          else
+            echo "append=false" >> "$GITHUB_OUTPUT"
+            echo "no release for $TAG yet; publishing a new one"
+          fi
+
       - name: Build release notes
         run: |
           set -euo pipefail
@@ -188,12 +415,13 @@ jobs:
           } > notes.md
 
           found=0
-          for archive in dist/*.tar.gz; do
+          for archive in dist/*.tar.gz dist/*.zip; do
             [ -e "$archive" ] || continue
             found=$((found + 1))
             name="$(basename "$archive")"
             target="${name#svgrender-${version}-}"
             target="${target%.tar.gz}"
+            target="${target%.zip}"
             size="$(du -h "$archive" | cut -f1)"
             sha="n/a"
             [ -f "${archive}.sha256" ] && sha="$(cut -d' ' -f1 "${archive}.sha256")"
@@ -201,18 +429,32 @@ jobs:
           done
 
           [ "$found" -gt 0 ] || { echo "::error::no archives found"; exit 1; }
+
           cat dist/*.sha256 > dist/checksums.txt
-          cat notes.md
+          if [ -f existing/checksums.txt ]; then
+            # Union of what is already published and what this run built; a name
+            # in both keeps this run's line so a re-run corrects a stale digest
+            # instead of duplicating the entry.
+            awk 'FNR==NR { if (NF) seen[$NF]=1; print; next }
+                 { if (NF && !($NF in seen)) print }' \
+              dist/checksums.txt existing/checksums.txt > dist/checksums.merged
+            mv dist/checksums.merged dist/checksums.txt
+          fi
+          cat notes.md dist/checksums.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('svgrender-{0}', needs.prepare.outputs.version) || github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
           name: svgrender ${{ needs.prepare.outputs.version }}
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          # Never demote an already published release back to a draft when a
+          # partial build appends to it.
+          draft: ${{ steps.existing.outputs.append != 'true' && github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          append_body: ${{ steps.existing.outputs.append == 'true' }}
           prerelease: false
           body_path: notes.md
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
             dist/checksums.txt
